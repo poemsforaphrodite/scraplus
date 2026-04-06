@@ -5,6 +5,9 @@ import { Loader2 } from "lucide-react";
 import { ResponseViewer } from "@/components/scraplus/response-viewer";
 import { UsageMock } from "@/components/scraplus/usage-mock";
 import { useToast } from "@/components/scraplus/toast";
+import { ConsolePanel } from "@/components/scraplus/console-panel";
+import { SegmentedControl } from "@/components/scraplus/segmented-control";
+import { FormatChips } from "@/components/scraplus/format-chips";
 
 const MODES = ["auto", "html", "js", "pdf", "ocr"] as const;
 const FORMATS = ["html", "text", "markdown", "json"] as const;
@@ -174,19 +177,14 @@ export function ScrapePlayground() {
   return (
     <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_280px]">
       <div className="space-y-6">
-        <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_0_40px_-12px_rgba(196,245,66,0.12)]">
-          <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
-            <div>
-              <h2 className="text-lg font-semibold tracking-tight text-[var(--text)]">
-                Scrape playground
-              </h2>
-              <p className="mt-1 text-sm text-[var(--muted)]">
-                POST <code className="text-[var(--accent-dim)]">/api/v1/scrape</code>{" "}
-                — Cmd+Enter to run
-              </p>
-            </div>
-          </div>
-
+        <ConsolePanel
+          className="panel-reveal"
+          overline="POST /api/v1/scrape"
+          title="Scrape playground"
+          description={
+            "Configure a request — Cmd+Enter or Ctrl+Enter to run when focused."
+          }
+        >
           <div className="space-y-4" onKeyDown={onKeyDown}>
             <label className="block space-y-1.5">
               <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
@@ -196,30 +194,23 @@ export function ScrapePlayground() {
                 type="url"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none ring-[var(--accent)]/30 focus:ring-2"
+                className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
                 autoComplete="off"
               />
             </label>
 
             <div className="grid gap-4 sm:grid-cols-2">
-              <label className="block space-y-1.5">
-                <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+              <div className="space-y-1.5">
+                <span className="block font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                   Mode
                 </span>
-                <select
+                <SegmentedControl
+                  ariaLabel="Scrape mode"
                   value={mode}
-                  onChange={(e) =>
-                    setMode(e.target.value as (typeof MODES)[number])
-                  }
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
-                >
-                  {MODES.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  onChange={setMode}
+                  options={MODES}
+                />
+              </div>
               <label className="block space-y-1.5">
                 <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                   Timeout (sec)
@@ -230,32 +221,17 @@ export function ScrapePlayground() {
                   max={60}
                   value={timeoutSec}
                   onChange={(e) => setTimeoutSec(Number(e.target.value) || 15)}
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                  className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
                 />
               </label>
             </div>
 
-            <fieldset>
-              <legend className="mb-2 font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
-                Formats
-              </legend>
-              <div className="flex flex-wrap gap-3">
-                {FORMATS.map((f) => (
-                  <label
-                    key={f}
-                    className="flex cursor-pointer items-center gap-2 text-sm"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedFormats.has(f)}
-                      onChange={() => toggleFormat(f)}
-                      className="rounded border-[var(--border)] bg-[var(--bg-deep)]"
-                    />
-                    {f}
-                  </label>
-                ))}
-              </div>
-            </fieldset>
+            <FormatChips
+              legend="Formats"
+              formats={FORMATS}
+              selected={selectedFormats}
+              onToggle={toggleFormat}
+            />
 
             <label className="block space-y-1.5">
               <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
@@ -266,7 +242,7 @@ export function ScrapePlayground() {
                 onChange={(e) => setHeadersJson(e.target.value)}
                 rows={3}
                 placeholder='{"Accept-Language": "en-US"}'
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-xs outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
               />
             </label>
 
@@ -279,7 +255,7 @@ export function ScrapePlayground() {
                   <input
                     value={waitFor}
                     onChange={(e) => setWaitFor(e.target.value)}
-                    className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                    className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
                     placeholder="#main"
                   />
                 </label>
@@ -288,6 +264,7 @@ export function ScrapePlayground() {
                     type="checkbox"
                     checked={screenshot}
                     onChange={(e) => setScreenshot(e.target.checked)}
+                    className="rounded border-[var(--border)]"
                   />
                   Request screenshot (PNG base64 in response)
                 </label>
@@ -299,6 +276,7 @@ export function ScrapePlayground() {
                 type="checkbox"
                 checked={asyncJob}
                 onChange={(e) => setAsyncJob(e.target.checked)}
+                className="rounded border-[var(--border)]"
               />
               Async job (poll until complete)
             </label>
@@ -307,10 +285,14 @@ export function ScrapePlayground() {
               type="button"
               disabled={busy}
               onClick={() => void runScrape()}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2.5 font-[family-name:var(--font-mono)] text-xs font-semibold uppercase tracking-wider text-black transition hover:brightness-110 disabled:opacity-50"
+              className="relative flex w-full items-center justify-center gap-2 overflow-hidden rounded-md bg-[var(--accent)] px-4 py-2.5 font-[family-name:var(--font-mono)] text-xs font-semibold uppercase tracking-wider text-black transition hover:brightness-110 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-deep)]"
             >
               {busy ? (
                 <>
+                  <span
+                    className="h-2 w-2 shrink-0 rounded-full bg-black/80 animate-pulse"
+                    aria-hidden
+                  />
                   <Loader2 className="h-4 w-4 animate-spin" />
                   Working…
                 </>
@@ -319,12 +301,23 @@ export function ScrapePlayground() {
               )}
             </button>
           </div>
-        </section>
+        </ConsolePanel>
 
-        <section className="space-y-3">
+        <section className="panel-reveal panel-reveal-delay-1 space-y-3">
           {httpStatus != null && (
             <p className="font-mono text-xs text-[var(--muted)]">
-              HTTP <span className="text-[var(--text)]">{httpStatus}</span>
+              HTTP{" "}
+              <span
+                className={
+                  httpStatus >= 200 && httpStatus < 300
+                    ? "text-[var(--status-ok)]"
+                    : httpStatus >= 400
+                      ? "text-[var(--status-err)]"
+                      : "text-[var(--text)]"
+                }
+              >
+                {httpStatus}
+              </span>
             </p>
           )}
           {error && (
@@ -336,7 +329,7 @@ export function ScrapePlayground() {
         </section>
       </div>
 
-      <div className="space-y-4 lg:sticky lg:top-24 lg:self-start">
+      <div className="panel-reveal panel-reveal-delay-2 space-y-4 lg:sticky lg:top-24 lg:self-start">
         <UsageMock />
       </div>
     </div>

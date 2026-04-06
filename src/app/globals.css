@@ -14,6 +14,11 @@ html.dark {
   --muted: #71717a;
   --accent: #c4f542;
   --accent-dim: #9fcc2c;
+  --panel-glow: 0 0 32px -8px rgba(196, 245, 66, 0.14);
+  --focus-ring: rgba(196, 245, 66, 0.45);
+  --status-ok: #34d399;
+  --status-err: #f87171;
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 html.light {
@@ -27,10 +32,15 @@ html.light {
   --muted: #52525b;
   --accent: #3f6212;
   --accent-dim: #4d7c0f;
+  --panel-glow: 0 0 24px -8px rgba(63, 98, 18, 0.12);
+  --focus-ring: rgba(63, 98, 18, 0.4);
+  --status-ok: #15803d;
+  --status-err: #dc2626;
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @theme inline {
-  --font-sans: var(--font-dm-sans);
+  --font-sans: var(--font-outfit);
   --font-mono: var(--font-ibm-plex-mono);
 }
 
@@ -42,7 +52,38 @@ body {
 body {
   background: var(--bg-deep);
   color: var(--text);
-  font-family: var(--font-dm-sans), system-ui, sans-serif;
+  font-family: var(--font-outfit), system-ui, sans-serif;
+}
+
+@keyframes panel-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.panel-reveal {
+  animation: panel-reveal 0.45s var(--ease-out-expo) both;
+}
+
+.panel-reveal-delay-1 {
+  animation-delay: 60ms;
+}
+
+.panel-reveal-delay-2 {
+  animation-delay: 120ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-reveal,
+  .panel-reveal-delay-1,
+  .panel-reveal-delay-2 {
+    animation: none;
+  }
 }
 
 /* subtle noise overlay */

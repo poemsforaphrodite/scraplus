@@ -4,6 +4,8 @@ import { useCallback, useState } from "react";
 import { Loader2, OctagonX } from "lucide-react";
 import { useToast } from "@/components/scraplus/toast";
 import { UsageMock } from "@/components/scraplus/usage-mock";
+import { ConsolePanel } from "@/components/scraplus/console-panel";
+import { SegmentedControl } from "@/components/scraplus/segmented-control";
 
 type CrawlRow = {
   url?: string;
@@ -151,16 +153,13 @@ export function CrawlManager() {
   return (
     <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_280px]">
       <div className="space-y-6">
-        <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
-          <h2 className="text-lg font-semibold text-[var(--text)]">
-            Recursive crawl
-          </h2>
-          <p className="mt-1 text-sm text-[var(--muted)]">
-            Discovers links from the seed URL (and optional sitemap), with SSRF
-            guards. Runs as chained Modal steps.
-          </p>
-
-          <div className="mt-4 space-y-4">
+        <ConsolePanel
+          className="panel-reveal"
+          overline="POST /api/v1/crawl"
+          title="Recursive crawl"
+          description="Discovers links from the seed URL (and optional sitemap), with SSRF guards. Chained Modal steps."
+        >
+          <div className="space-y-4">
             <label className="block space-y-1.5">
               <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                 Seed URL
@@ -168,7 +167,7 @@ export function CrawlManager() {
               <input
                 value={seedUrl}
                 onChange={(e) => setSeedUrl(e.target.value)}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
               />
             </label>
 
@@ -204,42 +203,36 @@ export function CrawlManager() {
                   className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm"
                 />
               </label>
-              <label className="block space-y-1.5">
-                <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+              <div className="space-y-1.5">
+                <span className="block font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                   robots.txt
                 </span>
-                <select
+                <SegmentedControl
+                  ariaLabel="Robots.txt policy"
                   value={robots}
-                  onChange={(e) =>
-                    setRobots(e.target.value as "ignore" | "honor")
+                  onChange={setRobots}
+                  options={
+                    [
+                      { value: "ignore", label: "ignore" },
+                      { value: "honor", label: "honor" },
+                    ] as const
                   }
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm"
-                >
-                  <option value="ignore">ignore</option>
-                  <option value="honor">honor</option>
-                </select>
-              </label>
+                />
+              </div>
             </div>
 
             <div className="grid gap-4 sm:grid-cols-2">
-              <label className="block space-y-1.5">
-                <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+              <div className="space-y-1.5">
+                <span className="block font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                   Scrape mode
                 </span>
-                <select
+                <SegmentedControl
+                  ariaLabel="Crawl scrape mode"
                   value={mode}
-                  onChange={(e) =>
-                    setMode(e.target.value as (typeof MODES)[number])
-                  }
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm"
-                >
-                  {MODES.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  onChange={setMode}
+                  options={MODES}
+                />
+              </div>
               <label className="block space-y-1.5">
                 <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                   Timeout (sec)
@@ -260,10 +253,14 @@ export function CrawlManager() {
                 type="button"
                 disabled={loading}
                 onClick={() => void submitCrawl()}
-                className="flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-black hover:brightness-110 disabled:opacity-50"
+                className="flex items-center gap-2 rounded-md bg-[var(--accent)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-black transition hover:brightness-110 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-deep)]"
               >
                 {loading ? (
                   <>
+                    <span
+                      className="h-2 w-2 shrink-0 rounded-full bg-black/80 animate-pulse"
+                      aria-hidden
+                    />
                     <Loader2 className="h-4 w-4 animate-spin" />
                     Running…
                   </>
@@ -275,7 +272,7 @@ export function CrawlManager() {
                 <button
                   type="button"
                   onClick={() => void cancelCrawl()}
-                  className="flex items-center gap-2 rounded-lg border border-amber-500/40 px-4 py-2 font-mono text-xs uppercase tracking-wider text-amber-200 hover:bg-amber-500/10"
+                  className="flex items-center gap-2 rounded-md border border-amber-500/40 px-4 py-2 font-mono text-xs uppercase tracking-wider text-amber-200 transition hover:bg-amber-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
                 >
                   <OctagonX className="h-4 w-4" />
                   Cancel
@@ -283,10 +280,10 @@ export function CrawlManager() {
               )}
             </div>
           </div>
-        </section>
+        </ConsolePanel>
 
         {state && (
-          <section className="space-y-3">
+          <section className="panel-reveal panel-reveal-delay-1 space-y-3">
             <p className="font-mono text-xs text-[var(--muted)]">
               Status:{" "}
               <span className="text-[var(--text)]">{state.status ?? "—"}</span>
@@ -336,7 +333,9 @@ export function CrawlManager() {
           </section>
         )}
       </div>
-      <UsageMock />
+      <div className="panel-reveal panel-reveal-delay-2 lg:sticky lg:top-24 lg:self-start">
+        <UsageMock />
+      </div>
     </div>
   );
 }

@@ -6,6 +6,9 @@ import { clsx } from "clsx";
 import ReactMarkdown from "react-markdown";
 import { useToast } from "@/components/scraplus/toast";
 import { UsageMock } from "@/components/scraplus/usage-mock";
+import { ConsolePanel } from "@/components/scraplus/console-panel";
+import { SegmentedControl } from "@/components/scraplus/segmented-control";
+import { FormatChips } from "@/components/scraplus/format-chips";
 
 const MODES = ["auto", "html", "js", "pdf", "ocr"] as const;
 const FORMATS = ["html", "text", "markdown", "json"] as const;
@@ -165,15 +168,13 @@ export function BatchManager() {
   return (
     <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_280px]">
       <div className="space-y-6">
-        <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
-          <h2 className="text-lg font-semibold text-[var(--text)]">
-            Batch manager
-          </h2>
-          <p className="mt-1 text-sm text-[var(--muted)]">
-            One URL per line — uses Modal fan-out with bounded concurrency.
-          </p>
-
-          <div className="mt-4 space-y-4">
+        <ConsolePanel
+          className="panel-reveal"
+          overline="POST /api/v1/batch"
+          title="Batch manager"
+          description="One URL per line — Modal fan-out with bounded concurrency."
+        >
+          <div className="space-y-4">
             <label className="block space-y-1.5">
               <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                 URLs
@@ -182,29 +183,22 @@ export function BatchManager() {
                 value={urlsText}
                 onChange={(e) => setUrlsText(e.target.value)}
                 rows={8}
-                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-xs outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
               />
             </label>
 
             <div className="grid gap-4 sm:grid-cols-2">
-              <label className="block space-y-1.5">
-                <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+              <div className="space-y-1.5">
+                <span className="block font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                   Mode
                 </span>
-                <select
+                <SegmentedControl
+                  ariaLabel="Batch scrape mode"
                   value={mode}
-                  onChange={(e) =>
-                    setMode(e.target.value as (typeof MODES)[number])
-                  }
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm"
-                >
-                  {MODES.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  onChange={setMode}
+                  options={MODES}
+                />
+              </div>
               <label className="block space-y-1.5">
                 <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
                   Timeout (sec)
@@ -215,38 +209,31 @@ export function BatchManager() {
                   max={60}
                   value={timeoutSec}
                   onChange={(e) => setTimeoutSec(Number(e.target.value) || 15)}
-                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm"
+                  className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
                 />
               </label>
             </div>
 
-            <fieldset>
-              <legend className="mb-2 font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
-                Formats
-              </legend>
-              <div className="flex flex-wrap gap-3">
-                {FORMATS.map((f) => (
-                  <label key={f} className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={selectedFormats.has(f)}
-                      onChange={() => toggleFormat(f)}
-                    />
-                    {f}
-                  </label>
-                ))}
-              </div>
-            </fieldset>
+            <FormatChips
+              legend="Formats"
+              formats={FORMATS}
+              selected={selectedFormats}
+              onToggle={toggleFormat}
+            />
 
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
                 disabled={loading}
                 onClick={() => void submitBatch()}
-                className="flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-black hover:brightness-110 disabled:opacity-50"
+                className="relative flex items-center gap-2 rounded-md bg-[var(--accent)] px-4 py-2 font-[family-name:var(--font-mono)] text-xs font-semibold uppercase tracking-wider text-black transition hover:brightness-110 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-deep)]"
               >
                 {loading ? (
                   <>
+                    <span
+                      className="h-2 w-2 shrink-0 rounded-full bg-black/80 animate-pulse"
+                      aria-hidden
+                    />
                     <Loader2 className="h-4 w-4 animate-spin" />
                     Running…
                   </>
@@ -258,7 +245,7 @@ export function BatchManager() {
                 <button
                   type="button"
                   onClick={() => void cancelBatch()}
-                  className="flex items-center gap-2 rounded-lg border border-amber-500/40 px-4 py-2 font-mono text-xs uppercase tracking-wider text-amber-200 hover:bg-amber-500/10"
+                  className="flex items-center gap-2 rounded-md border border-amber-500/40 px-4 py-2 font-mono text-xs uppercase tracking-wider text-amber-200 transition hover:bg-amber-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
                 >
                   <OctagonX className="h-4 w-4" />
                   Cancel
@@ -266,10 +253,10 @@ export function BatchManager() {
               )}
             </div>
           </div>
-        </section>
+        </ConsolePanel>
 
         {state && (
-          <section className="space-y-3">
+          <section className="panel-reveal panel-reveal-delay-1 space-y-3">
             <div className="flex flex-wrap items-center gap-3">
               <span className="font-mono text-xs text-[var(--muted)]">
                 Status:{" "}
@@ -282,15 +269,15 @@ export function BatchManager() {
                     </span>
                   )}
               </span>
-              <div className="ml-auto flex gap-1 rounded-lg border border-[var(--border)] p-0.5">
+              <div className="ml-auto flex gap-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-deep)] p-0.5">
                 <button
                   type="button"
                   onClick={() => setViewFmt("markdown")}
                   className={clsx(
-                    "rounded px-2 py-1 font-mono text-[10px] uppercase",
+                    "rounded px-2 py-1 font-mono text-[10px] uppercase transition",
                     viewFmt === "markdown"
-                      ? "bg-[var(--surface-active)]"
-                      : "text-[var(--muted)]",
+                      ? "bg-[var(--surface-active)] text-[var(--text)]"
+                      : "text-[var(--muted)] hover:text-[var(--text)]",
                   )}
                 >
                   MD
@@ -299,10 +286,10 @@ export function BatchManager() {
                   type="button"
                   onClick={() => setViewFmt("json")}
                   className={clsx(
-                    "rounded px-2 py-1 font-mono text-[10px] uppercase",
+                    "rounded px-2 py-1 font-mono text-[10px] uppercase transition",
                     viewFmt === "json"
-                      ? "bg-[var(--surface-active)]"
-                      : "text-[var(--muted)]",
+                      ? "bg-[var(--surface-active)] text-[var(--text)]"
+                      : "text-[var(--muted)] hover:text-[var(--text)]",
                   )}
                 >
                   JSON
@@ -310,7 +297,7 @@ export function BatchManager() {
               </div>
             </div>
 
-            <div className="overflow-hidden rounded-xl border border-[var(--border)]">
+            <div className="overflow-hidden rounded-lg border border-[var(--border)]">
               <table className="w-full text-left text-sm">
                 <thead className="border-b border-[var(--border)] bg-black/30 font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-wider text-[var(--muted)]">
                   <tr>
@@ -328,9 +315,9 @@ export function BatchManager() {
                         </td>
                         <td className="px-3 py-2">
                           {row.ok ? (
-                            <span className="text-emerald-400">ok</span>
+                            <span className="text-[var(--status-ok)]">ok</span>
                           ) : (
-                            <span className="text-red-400">fail</span>
+                            <span className="text-[var(--status-err)]">fail</span>
                           )}
                         </td>
                         <td className="px-2 py-2">
@@ -343,7 +330,7 @@ export function BatchManager() {
                                 [i]: !e[i],
                               }))
                             }
-                            className="rounded p-1 hover:bg-white/10"
+                            className="rounded p-1 hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
                           >
                             {expanded[i] ? (
                               <ChevronDown className="h-4 w-4" />
@@ -355,7 +342,7 @@ export function BatchManager() {
                       </tr>
                       {expanded[i] && (
                         <tr>
-                          <td colSpan={3} className="bg-black/20 px-3 py-3">
+                          <td colSpan={3} className="bg-[var(--bg-deep)] px-3 py-3">
                             {!row.ok && (
                               <pre className="whitespace-pre-wrap text-xs text-red-300">
                                 {row.error}
@@ -388,7 +375,9 @@ export function BatchManager() {
           </section>
         )}
       </div>
-      <UsageMock />
+      <div className="panel-reveal panel-reveal-delay-2 lg:sticky lg:top-24 lg:self-start">
+        <UsageMock />
+      </div>
     </div>
   );
 }
