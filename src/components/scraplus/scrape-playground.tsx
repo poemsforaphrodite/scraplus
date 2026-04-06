@@ -1,0 +1,344 @@
+"use client";
+
+import { useCallback, useState } from "react";
+import { Loader2 } from "lucide-react";
+import { ResponseViewer } from "@/components/scraplus/response-viewer";
+import { UsageMock } from "@/components/scraplus/usage-mock";
+import { useToast } from "@/components/scraplus/toast";
+
+const MODES = ["auto", "html", "js", "pdf", "ocr"] as const;
+const FORMATS = ["html", "text", "markdown", "json"] as const;
+
+export function ScrapePlayground() {
+  const toast = useToast();
+  const [url, setUrl] = useState("https://example.com");
+  const [mode, setMode] = useState<(typeof MODES)[number]>("auto");
+  const [timeoutSec, setTimeoutSec] = useState(15);
+  const [selectedFormats, setSelectedFormats] = useState<Set<string>>(
+    () => new Set(["markdown", "text", "json"]),
+  );
+  const [headersJson, setHeadersJson] = useState("");
+  const [waitFor, setWaitFor] = useState("");
+  const [screenshot, setScreenshot] = useState(false);
+  const [asyncJob, setAsyncJob] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [pollLoading, setPollLoading] = useState(false);
+  const [httpStatus, setHttpStatus] = useState<number | null>(null);
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const toggleFormat = (f: string) => {
+    setSelectedFormats((prev) => {
+      const n = new Set(prev);
+      if (n.has(f)) n.delete(f);
+      else n.add(f);
+      if (n.size === 0) n.add("text");
+      return n;
+    });
+  };
+
+  const runScrape = useCallback(async () => {
+    setLoading(true);
+    setPollLoading(false);
+    setError(null);
+    setResult(null);
+    setHttpStatus(null);
+
+    let headers: Record<string, string> | undefined;
+    if (headersJson.trim()) {
+      try {
+        const parsed = JSON.parse(headersJson) as unknown;
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+          throw new Error("Headers must be a JSON object");
+        headers = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof v === "string") headers[k] = v;
+        }
+      } catch (e) {
+        setLoading(false);
+        setError(e instanceof Error ? e.message : "Invalid headers JSON");
+        toast("Invalid headers JSON", "error");
+        return;
+      }
+    }
+
+    const body: Record<string, unknown> = {
+      url: url.trim(),
+      mode,
+      formats: [...selectedFormats],
+      timeout: timeoutSec,
+      async: asyncJob,
+    };
+    if (headers && Object.keys(headers).length) body.headers = headers;
+    if (waitFor.trim() && (mode === "js" || mode === "auto")) {
+      body.wait_for = waitFor.trim();
+    }
+    if (screenshot && (mode === "js" || mode === "auto")) {
+      body.screenshot = true;
+    }
+
+    try {
+      const res = await fetch("/api/v1/scrape", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      setHttpStatus(res.status);
+      const data = (await res.json().catch(() => ({}))) as Record<
+        string,
+        unknown
+      >;
+
+      if (!res.ok) {
+        const msg =
+          typeof data.error === "string" ? data.error : JSON.stringify(data);
+        setError(msg);
+        toast(`Scrape failed (${res.status})`, "error");
+        return;
+      }
+
+      if (asyncJob && typeof data.job_id === "string") {
+        toast("Job started — polling…", "info");
+        setPollLoading(true);
+        const jobId = data.job_id;
+        const deadline = Date.now() + 90_000;
+        let final: Record<string, unknown> | null = null;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 1200));
+          const jr = await fetch(`/api/v1/jobs/${encodeURIComponent(jobId)}`);
+          const jd = (await jr.json().catch(() => ({}))) as Record<
+            string,
+            unknown
+          >;
+          if (!jr.ok) {
+            setError(
+              typeof jd.error === "string" ? jd.error : "Job poll failed",
+            );
+            toast("Job poll failed", "error");
+            setPollLoading(false);
+            return;
+          }
+          const st = jd.status;
+          if (st === "completed" && jd.result) {
+            final = jd.result as Record<string, unknown>;
+            break;
+          }
+          if (st === "failed") {
+            setError(typeof jd.error === "string" ? jd.error : "Job failed");
+            toast("Job failed", "error");
+            setPollLoading(false);
+            return;
+          }
+        }
+        setPollLoading(false);
+        if (final) {
+          setResult(final);
+          toast("Scrape completed", "success");
+        } else {
+          setError("Timed out waiting for job");
+          toast("Job timeout", "error");
+        }
+        return;
+      }
+
+      setResult(data);
+      toast("Scrape completed", "success");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Request failed";
+      setError(msg);
+      toast(msg, "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    url,
+    mode,
+    selectedFormats,
+    timeoutSec,
+    headersJson,
+    waitFor,
+    screenshot,
+    asyncJob,
+    toast,
+  ]);
+
+  function onKeyDown(e: React.KeyboardEvent) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      void runScrape();
+    }
+  }
+
+  const busy = loading || pollLoading;
+
+  return (
+    <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_280px]">
+      <div className="space-y-6">
+        <section className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_0_40px_-12px_rgba(196,245,66,0.12)]">
+          <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-[var(--text)]">
+                Scrape playground
+              </h2>
+              <p className="mt-1 text-sm text-[var(--muted)]">
+                POST <code className="text-[var(--accent-dim)]">/api/v1/scrape</code>{" "}
+                — Cmd+Enter to run
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-4" onKeyDown={onKeyDown}>
+            <label className="block space-y-1.5">
+              <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+                URL
+              </span>
+              <input
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none ring-[var(--accent)]/30 focus:ring-2"
+                autoComplete="off"
+              />
+            </label>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="block space-y-1.5">
+                <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+                  Mode
+                </span>
+                <select
+                  value={mode}
+                  onChange={(e) =>
+                    setMode(e.target.value as (typeof MODES)[number])
+                  }
+                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                >
+                  {MODES.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block space-y-1.5">
+                <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+                  Timeout (sec)
+                </span>
+                <input
+                  type="number"
+                  min={3}
+                  max={60}
+                  value={timeoutSec}
+                  onChange={(e) => setTimeoutSec(Number(e.target.value) || 15)}
+                  className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                />
+              </label>
+            </div>
+
+            <fieldset>
+              <legend className="mb-2 font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+                Formats
+              </legend>
+              <div className="flex flex-wrap gap-3">
+                {FORMATS.map((f) => (
+                  <label
+                    key={f}
+                    className="flex cursor-pointer items-center gap-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedFormats.has(f)}
+                      onChange={() => toggleFormat(f)}
+                      className="rounded border-[var(--border)] bg-[var(--bg-deep)]"
+                    />
+                    {f}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
+            <label className="block space-y-1.5">
+              <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+                Custom headers (JSON object)
+              </span>
+              <textarea
+                value={headersJson}
+                onChange={(e) => setHeadersJson(e.target.value)}
+                rows={3}
+                placeholder='{"Accept-Language": "en-US"}'
+                className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-xs outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+              />
+            </label>
+
+            {(mode === "js" || mode === "auto") && (
+              <>
+                <label className="block space-y-1.5">
+                  <span className="font-[family-name:var(--font-mono)] text-[10px] uppercase tracking-widest text-[var(--muted)]">
+                    wait_for selector (Playwright)
+                  </span>
+                  <input
+                    value={waitFor}
+                    onChange={(e) => setWaitFor(e.target.value)}
+                    className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-deep)] px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-[var(--accent)]/30"
+                    placeholder="#main"
+                  />
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={screenshot}
+                    onChange={(e) => setScreenshot(e.target.checked)}
+                  />
+                  Request screenshot (PNG base64 in response)
+                </label>
+              </>
+            )}
+
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={asyncJob}
+                onChange={(e) => setAsyncJob(e.target.checked)}
+              />
+              Async job (poll until complete)
+            </label>
+
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void runScrape()}
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2.5 font-[family-name:var(--font-mono)] text-xs font-semibold uppercase tracking-wider text-black transition hover:brightness-110 disabled:opacity-50"
+            >
+              {busy ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Working…
+                </>
+              ) : (
+                "Run scrape"
+              )}
+            </button>
+          </div>
+        </section>
+
+        <section className="space-y-3">
+          {httpStatus != null && (
+            <p className="font-mono text-xs text-[var(--muted)]">
+              HTTP <span className="text-[var(--text)]">{httpStatus}</span>
+            </p>
+          )}
+          {error && (
+            <div className="rounded-lg border border-red-500/30 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+              {error}
+            </div>
+          )}
+          <ResponseViewer data={result} loading={busy && !result} />
+        </section>
+      </div>
+
+      <div className="space-y-4 lg:sticky lg:top-24 lg:self-start">
+        <UsageMock />
+      </div>
+    </div>
+  );
+}
