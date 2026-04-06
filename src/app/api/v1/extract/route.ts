@@ -3,8 +3,6 @@ import { modalRequest } from "@/lib/scraplus/modal-proxy";
 import { clampScrapeTimeout } from "@/lib/scraplus/timeout";
 import { assertPublicHttpUrl, SsrfError } from "@/lib/scrape/ssrf";
 
-const ALLOWED_MODES = new Set(["html", "js", "auto", "pdf", "ocr"]);
-
 function configErrorResponse() {
   return NextResponse.json(
     {
@@ -23,52 +21,43 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const urlsRaw = body.urls;
-  if (!Array.isArray(urlsRaw) || urlsRaw.length === 0) {
-    return NextResponse.json(
-      { error: "urls must be a non-empty array" },
-      { status: 400 },
-    );
+  const rawUrl =
+    typeof body.url === "string" ? body.url.trim() : "";
+  if (!rawUrl) {
+    return NextResponse.json({ error: "Missing url" }, { status: 400 });
   }
 
-  const urls: string[] = [];
-  for (const u of urlsRaw) {
-    const s = String(u).trim();
-    if (!s) continue;
-    try {
-      assertPublicHttpUrl(s);
-      urls.push(s);
-    } catch (e) {
-      if (e instanceof SsrfError) {
-        return NextResponse.json(
-          { error: `Blocked URL: ${e.message}`, url: s },
-          { status: 400 },
-        );
-      }
-      throw e;
+  try {
+    assertPublicHttpUrl(rawUrl);
+  } catch (e) {
+    if (e instanceof SsrfError) {
+      return NextResponse.json({ error: e.message }, { status: 400 });
     }
+    throw e;
   }
 
-  if (urls.length === 0) {
-    return NextResponse.json({ error: "No valid URLs" }, { status: 400 });
-  }
-
-  const modeRaw =
-    typeof body.mode === "string" ? body.mode.toLowerCase().trim() : "auto";
-  if (!ALLOWED_MODES.has(modeRaw)) {
+  const selectors = body.selectors;
+  if (
+    selectors == null ||
+    typeof selectors !== "object" ||
+    Array.isArray(selectors)
+  ) {
     return NextResponse.json(
-      { error: `Invalid mode "${modeRaw}"`, allowed: [...ALLOWED_MODES] },
+      { error: "selectors must be an object (field -> CSS selector)" },
       { status: 400 },
     );
   }
 
-  let formats: string[] | undefined;
-  if (Array.isArray(body.formats) && body.formats.length > 0) {
-    formats = body.formats.map((f) => String(f).toLowerCase().trim());
-  }
+  const mode =
+    typeof body.mode === "string" ? body.mode.toLowerCase().trim() : "auto";
+  const timeout = clampScrapeTimeout(body.timeout);
 
   let headers: Record<string, string> | undefined;
-  if (body.headers != null && typeof body.headers === "object" && !Array.isArray(body.headers)) {
+  if (
+    body.headers != null &&
+    typeof body.headers === "object" &&
+    !Array.isArray(body.headers)
+  ) {
     headers = {};
     for (const [k, v] of Object.entries(body.headers)) {
       if (typeof v === "string") headers[k] = v;
@@ -76,12 +65,19 @@ export async function POST(request: Request) {
   }
 
   const forward: Record<string, unknown> = {
-    urls,
-    mode: modeRaw,
-    timeout: clampScrapeTimeout(body.timeout),
+    url: rawUrl,
+    selectors,
+    mode,
+    timeout,
+    ...(headers && Object.keys(headers).length ? { headers } : {}),
   };
-  if (formats) forward.formats = formats;
-  if (headers && Object.keys(headers).length) forward.headers = headers;
+  if (
+    body.schema != null &&
+    typeof body.schema === "object" &&
+    !Array.isArray(body.schema)
+  ) {
+    forward.schema = body.schema;
+  }
   if (
     body.scrape_options != null &&
     typeof body.scrape_options === "object" &&
@@ -91,7 +87,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const res = await modalRequest("/batch", {
+    const res = await modalRequest("/extract", {
       method: "POST",
       body: JSON.stringify(forward),
     });
@@ -109,7 +105,12 @@ export async function POST(request: Request) {
         "detail" in data &&
         typeof (data as { detail: unknown }).detail === "string"
           ? (data as { detail: string }).detail
-          : text || res.statusText;
+          : typeof data === "object" &&
+              data !== null &&
+              "error" in data &&
+              typeof (data as { error: unknown }).error === "string"
+            ? (data as { error: string }).error
+            : text || res.statusText;
       return NextResponse.json({ error: detail }, { status: res.status });
     }
     return NextResponse.json(data);

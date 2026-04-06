@@ -95,7 +95,7 @@ export async function POST(request: Request) {
     body.async === true || body.async_job === true,
   );
 
-  const forward = {
+  const forward: Record<string, unknown> = {
     url: rawUrl,
     mode: modeRaw,
     formats,
@@ -105,6 +105,43 @@ export async function POST(request: Request) {
     ...(screenshot ? { screenshot: true } : {}),
     ...(asyncJob ? { async: true } : {}),
   };
+
+  const boolOr = (k: string) =>
+    body[k] === true ? { [k]: true } : {};
+  Object.assign(forward, boolOr("only_main_content"));
+  Object.assign(forward, boolOr("mobile"));
+  Object.assign(forward, boolOr("skip_tls_verification"));
+  if (typeof body.verify_ssl === "boolean") {
+    forward.verify_ssl = body.verify_ssl;
+  }
+  if (typeof body.wait_ms === "number" && Number.isFinite(body.wait_ms)) {
+    forward.wait_ms = Math.max(0, Math.floor(body.wait_ms));
+  }
+  if (typeof body.proxy === "string" && body.proxy.trim()) {
+    forward.proxy = body.proxy.trim();
+  }
+  if (typeof body.max_age_ms === "number" && Number.isFinite(body.max_age_ms)) {
+    forward.max_age_ms = Math.max(0, Math.floor(body.max_age_ms));
+  }
+  if (typeof body.min_age_ms === "number" && Number.isFinite(body.min_age_ms)) {
+    forward.min_age_ms = Math.max(0, Math.floor(body.min_age_ms));
+  }
+  if (typeof body.pdf_mode === "string" && body.pdf_mode.trim()) {
+    forward.pdf_mode = body.pdf_mode.trim().toLowerCase();
+  }
+  if (Array.isArray(body.include_tags) && body.include_tags.length) {
+    forward.include_tags = body.include_tags.map((t) => String(t));
+  }
+  if (Array.isArray(body.exclude_tags) && body.exclude_tags.length) {
+    forward.exclude_tags = body.exclude_tags.map((t) => String(t));
+  }
+  if (
+    body.scrape_options != null &&
+    typeof body.scrape_options === "object" &&
+    !Array.isArray(body.scrape_options)
+  ) {
+    forward.scrape_options = body.scrape_options;
+  }
 
   try {
     const res = await modalRequest("/scrape", {

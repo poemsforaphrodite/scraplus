@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 from typing import Any
 
@@ -20,6 +21,7 @@ DEFAULT_UA = (
     "Mozilla/5.0 (compatible; Scraplus/1.0; +https://github.com/scraplus) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
 
 def clamp_timeout(timeout: float | None) -> float:
     v = float(timeout) if timeout is not None else 15.0
@@ -39,6 +41,46 @@ def build_headers(custom: dict[str, str] | None) -> dict[str, str]:
     return h
 
 
+def merge_scrape_options(body: dict[str, Any]) -> dict[str, Any]:
+    """Merge nested `scrape_options` into the body (top-level keys win)."""
+    base = dict(body)
+    so = base.pop("scrape_options", None)
+    if isinstance(so, dict):
+        return {**so, **base}
+    return base
+
+
+def extract_options_from_body(body: dict[str, Any] | None) -> dict[str, Any]:
+    if not body:
+        return {}
+    inc = body.get("include_tags")
+    exc = body.get("exclude_tags")
+    return {
+        "only_main_content": bool(body.get("only_main_content")),
+        "include_tags": inc if isinstance(inc, list) else None,
+        "exclude_tags": exc if isinstance(exc, list) else None,
+    }
+
+
+def httpx_proxy_url(body: dict[str, Any] | None) -> str | None:
+    if not body:
+        return os.environ.get("SCRAPLUS_HTTP_PROXY") or None
+    p = body.get("proxy") or body.get("proxy_url")
+    if isinstance(p, str) and p.strip():
+        return p.strip()
+    return os.environ.get("SCRAPLUS_HTTP_PROXY") or None
+
+
+def httpx_verify(body: dict[str, Any] | None) -> bool:
+    if not body:
+        return True
+    if body.get("skip_tls_verification") is True:
+        return False
+    if body.get("verify_ssl") is False:
+        return False
+    return True
+
+
 def should_escalate_to_playwright(html: str) -> bool:
     soup = BeautifulSoup(html, "lxml")
     n_scripts = len(soup.find_all("script"))
@@ -55,11 +97,21 @@ def should_escalate_to_playwright(html: str) -> bool:
 
 
 def httpx_fetch(
-    url: str, timeout: float, headers: dict[str, str] | None
+    url: str,
+    timeout: float,
+    headers: dict[str, str] | None,
+    *,
+    verify: bool = True,
+    proxy_url: str | None = None,
 ) -> tuple[str, int, str | None, bytes, str]:
     url = assert_public_http_url(url)
     t = httpx.Timeout(timeout + 2.0, connect=min(10.0, timeout))
-    with httpx.Client(timeout=t, follow_redirects=True) as client:
+    with httpx.Client(
+        timeout=t,
+        follow_redirects=True,
+        verify=verify,
+        proxy=proxy_url,
+    ) as client:
         r = client.get(url, headers=build_headers(headers))
         ct = r.headers.get("content-type")
         cl = r.headers.get("content-length")
@@ -83,16 +135,33 @@ def scrape_pdf(
     timeout: float,
     headers: dict[str, str] | None,
     formats: list[str],
+    *,
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    final_url, status_code, content_type, buf, _t = httpx_fetch(url, timeout, headers)
-    text_parts: list[str] = []
-    with pdfplumber.open(io.BytesIO(buf)) as pdf:
-        for page in pdf.pages:
-            pt = page.extract_text()
-            if pt:
-                text_parts.append(pt)
-    full_text = "\n\n".join(text_parts).strip()
-    content = formats_payload(formats, full_text, None, None, None, None)
+    verify = httpx_verify(body)
+    proxy = httpx_proxy_url(body)
+    final_url, status_code, content_type, buf, _t = httpx_fetch(
+        url, timeout, headers, verify=verify, proxy_url=proxy
+    )
+    mode = (body or {}).get("pdf_mode", "text").lower()
+    if mode == "markdown":
+        text_parts: list[str] = []
+        with pdfplumber.open(io.BytesIO(buf)) as pdf:
+            for page in pdf.pages:
+                pt = page.extract_text()
+                if pt:
+                    text_parts.append(pt.strip())
+        full_text = "\n\n".join(text_parts).strip()
+        content = formats_payload(formats, full_text, None, None, None, None)
+    else:
+        text_parts = []
+        with pdfplumber.open(io.BytesIO(buf)) as pdf:
+            for page in pdf.pages:
+                pt = page.extract_text()
+                if pt:
+                    text_parts.append(pt)
+        full_text = "\n\n".join(text_parts).strip()
+        content = formats_payload(formats, full_text, None, None, None, None)
     return _ok_response(
         final_url,
         status_code,
@@ -111,8 +180,14 @@ def scrape_ocr(
     timeout: float,
     headers: dict[str, str] | None,
     formats: list[str],
+    *,
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    final_url, status_code, content_type, buf, _t = httpx_fetch(url, timeout, headers)
+    verify = httpx_verify(body)
+    proxy = httpx_proxy_url(body)
+    final_url, status_code, content_type, buf, _t = httpx_fetch(
+        url, timeout, headers, verify=verify, proxy_url=proxy
+    )
     img = Image.open(io.BytesIO(buf))
     ocr_text = pytesseract.image_to_string(img).strip()
     content = formats_payload(formats, ocr_text, None, None, None, None)
@@ -205,12 +280,24 @@ def scrape_http_html(
     formats: list[str],
     timeout: float,
     headers: dict[str, str] | None,
+    body: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Returns (response dict, raw html string)."""
+    verify = httpx_verify(body)
+    proxy = httpx_proxy_url(body)
+    xopts = extract_options_from_body(body)
+    max_age_ms = None
+    min_age_ms = None
+    if body:
+        if body.get("max_age_ms") is not None:
+            max_age_ms = int(body["max_age_ms"])
+        if body.get("min_age_ms") is not None:
+            min_age_ms = int(body["min_age_ms"])
+
     final_url, status_code, content_type, _buf, html = httpx_fetch(
-        url, timeout, headers
+        url, timeout, headers, verify=verify, proxy_url=proxy
     )
-    extracted = extract_from_html(html, formats)
+    extracted = extract_from_html(html, formats, **xopts)
     content = extracted["content"]
     resp = _ok_response(
         final_url,
@@ -224,6 +311,11 @@ def scrape_http_html(
         engine_note=None,
         escalated=False,
     )
+    # stash cache hints for caller (Modal app)
+    if max_age_ms is not None:
+        resp["_cache_max_age_ms"] = max_age_ms
+    if min_age_ms is not None:
+        resp["_cache_min_age_ms"] = min_age_ms
     return resp, html
 
 
@@ -237,8 +329,10 @@ def build_response_from_html(
     engine: str,
     escalated: bool,
     screenshot_b64: str | None = None,
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    extracted = extract_from_html(html, formats)
+    xopts = extract_options_from_body(body)
+    extracted = extract_from_html(html, formats, **xopts)
     return _ok_response(
         final_url,
         status_code,

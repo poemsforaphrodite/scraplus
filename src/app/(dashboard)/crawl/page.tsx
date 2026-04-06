@@ -1,5 +1,5 @@
-import { ComingSoon } from "../coming-soon";
+import { CrawlManager } from "@/components/scraplus/crawl-manager";
 
 export default function CrawlPage() {
-  return <ComingSoon title="Crawl" />;
+  return <CrawlManager />;
 }

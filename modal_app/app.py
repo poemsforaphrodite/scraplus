@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -12,27 +13,47 @@ from typing import Any
 import modal
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from jsonschema import validate as jsonschema_validate
+from jsonschema.exceptions import ValidationError
 
 # playwright_scrape imports playwright — only installed on browser_image. Lazy-import inside
 # scrape_playwright_fn so light_image workers (API, batch, job) can load app.py.
+from cache_lib import CACHE_DICT_NAME, cache_get, cache_key, cache_put
+from crawl_lib import (
+    CrawlRules,
+    apply_delay,
+    can_fetch_url_robots,
+    extract_links_from_html,
+    fetch_robots_txt,
+    fetch_sitemap_urls,
+    normalize_url,
+    seed_parts,
+    url_matches_rules,
+)
+from extract_selectors import extract_with_selectors
+from llm_extract import llm_extract_sync
 from scrape_core import (
     clamp_timeout,
+    merge_scrape_options,
     scrape_http_html,
     scrape_ocr,
     scrape_pdf,
     should_escalate_to_playwright,
 )
 from ssrf import SsrfError, assert_public_http_url
+from webhook_util import deliver_with_retries
+
+logger = logging.getLogger(__name__)
 
 APP_NAME = "scraplus"
 JOB_TTL_SEC = 600
+CRAWL_TTL_SEC = 7200
+CRAWL_STEP_URLS = 12
 JOBS_DICT = "scraplus-jobs-v1"
 BATCH_DICT = "scraplus-batches-v1"
+CRAWL_DICT = "scraplus-crawls-v1"
+EXTRACT_JOBS_DICT = "scraplus-extract-jobs-v1"
 
-# Multi-file app: Modal only injects the entrypoint module unless you add the rest of the tree.
-# Per Modal docs — use Image.add_local_dir(..., remote_path="/root") for a full directory, or
-# add_local_python_source("packagename") for importable packages on PYTHONPATH (see modal.Image).
-# https://modal.com/docs/reference/modal.Image#add_local_dir
 _SCRAPLUS_DIR = Path(__file__).resolve().parent
 _REQ_FILE = "modal_app/requirements-light.txt"
 _SOURCE_IGNORE = ["test_*.py", "**/.pytest_cache/**"]
@@ -56,7 +77,6 @@ browser_image = (
     .add_local_dir(_SCRAPLUS_DIR, remote_path="/root", ignore=_SOURCE_IGNORE)
 )
 
-# Create with: modal secret create scraplus-proxy-secret SCRAPLUS_PROXY_SECRET=...
 proxy_secret = modal.Secret.from_name(
     "scraplus-proxy-secret",
     required_keys=["SCRAPLUS_PROXY_SECRET"],
@@ -82,13 +102,55 @@ def batches_dict() -> modal.Dict:
     return modal.Dict.from_name(BATCH_DICT, create_if_missing=True)
 
 
-def touch_ttl(data: dict[str, Any] | None) -> dict[str, Any] | None:
+def crawls_dict() -> modal.Dict:
+    return modal.Dict.from_name(CRAWL_DICT, create_if_missing=True)
+
+
+def extract_jobs_dict() -> modal.Dict:
+    return modal.Dict.from_name(EXTRACT_JOBS_DICT, create_if_missing=True)
+
+
+def http_cache_dict() -> modal.Dict:
+    return modal.Dict.from_name(CACHE_DICT_NAME, create_if_missing=True)
+
+
+def touch_ttl(data: dict[str, Any] | None, ttl: float = JOB_TTL_SEC) -> dict[str, Any] | None:
     if not data:
         return None
     created = float(data.get("created_at", 0))
-    if time.time() - created > JOB_TTL_SEC:
+    if time.time() - created > ttl:
         return None
     return data
+
+
+class WebhookConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    url: str
+    secret: str = ""
+    events: list[str] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class CrawlRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    url: str
+    limit: int | None = 100
+    max_discovery_depth: int | None = None
+    include_paths: list[str] | None = None
+    exclude_paths: list[str] | None = None
+    regex_on_full_url: bool = False
+    crawl_entire_domain: bool = False
+    allow_subdomains: bool = False
+    allow_external_links: bool = False
+    sitemap: str = "include"
+    ignore_query_parameters: bool = False
+    delay_sec: float = 0
+    max_concurrency: int = 1
+    robots_policy: str = "ignore"
+    scrape_options: dict[str, Any] | None = None
+    webhook: WebhookConfig | None = None
 
 
 class ScrapeRequest(BaseModel):
@@ -102,6 +164,18 @@ class ScrapeRequest(BaseModel):
     wait_for: str | None = None
     screenshot: bool = False
     async_job: bool = Field(default=False, alias="async")
+    only_main_content: bool = False
+    include_tags: list[str] | None = None
+    exclude_tags: list[str] | None = None
+    wait_ms: int | None = None
+    mobile: bool = False
+    skip_tls_verification: bool = False
+    verify_ssl: bool | None = None
+    proxy: str | None = None
+    max_age_ms: int | None = None
+    min_age_ms: int | None = None
+    pdf_mode: str | None = None
+    scrape_options: dict[str, Any] | None = None
 
 
 class BatchRequest(BaseModel):
@@ -110,6 +184,32 @@ class BatchRequest(BaseModel):
     formats: list[str] | None = None
     timeout: float | None = None
     headers: dict[str, str] | None = None
+    scrape_options: dict[str, Any] | None = None
+
+
+class SelectorExtractRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    url: str
+    selectors: dict[str, str]
+    schema: dict[str, Any] | None = None
+    mode: str = "auto"
+    timeout: float | None = None
+    headers: dict[str, str] | None = None
+    scrape_options: dict[str, Any] | None = None
+
+
+class LLMExtractRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    urls: list[str] | None = None
+    url: str | None = None
+    prompt: str
+    schema: dict[str, Any] | None = None
+    mode: str = "auto"
+    timeout: float | None = None
+    headers: dict[str, str] | None = None
+    async_job: bool = Field(default=False, alias="async")
 
 
 @app.function(
@@ -125,8 +225,24 @@ def scrape_playwright_fn(body: dict) -> dict:
     return scrape_with_playwright(body)
 
 
-def perform_scrape(body: dict) -> dict:
+def scrape_body_from_scrape_request(req: ScrapeRequest) -> dict[str, Any]:
+    d = req.model_dump(exclude_none=True, by_alias=False)
+    d.pop("async_job", None)
+    return merge_scrape_options(d)
+
+
+def _cache_parts_for_body(body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "mode": body.get("mode"),
+        "formats": tuple(body.get("formats") or ()),
+        "only_main_content": body.get("only_main_content"),
+        "proxy": body.get("proxy"),
+    }
+
+
+def perform_scrape(body: dict[str, Any]) -> dict[str, Any]:
     """Orchestrates httpx + optional Playwright (remote)."""
+    body = merge_scrape_options(body)
     mode = (body.get("mode") or "auto").lower().strip()
     url = body["url"]
     assert_public_http_url(url)
@@ -134,26 +250,59 @@ def perform_scrape(body: dict) -> dict:
     headers = body.get("headers")
     formats = body.get("formats") or ["markdown", "text", "json"]
 
+    max_age_ms = body.get("max_age_ms")
+    min_age_ms = body.get("min_age_ms")
+    if max_age_ms is not None:
+        max_age_ms = int(max_age_ms)
+    if min_age_ms is not None:
+        min_age_ms = int(min_age_ms)
+
+    if max_age_ms is not None or min_age_ms is not None:
+        ck = cache_key(url, _cache_parts_for_body({**body, "mode": mode}))
+        cd = http_cache_dict()
+
+        def getter(k: str) -> dict[str, Any]:
+            return dict(cd[k])
+
+        cached = cache_get(
+            getter,
+            ck,
+            max_age_ms=max_age_ms,
+            min_age_ms=min_age_ms,
+        )
+        if cached is not None:
+            return cached
+        if min_age_ms is not None:
+            raise ValueError("SCRAPE_NO_CACHED_DATA")
+
     if mode == "pdf":
-        return scrape_pdf(url, timeout, headers, formats)
-    if mode == "ocr":
-        return scrape_ocr(url, timeout, headers, formats)
+        result = scrape_pdf(url, timeout, headers, formats, body=body)
+    elif mode == "ocr":
+        result = scrape_ocr(url, timeout, headers, formats, body=body)
+    elif mode == "js":
+        result = scrape_playwright_fn.remote({**body, "url": url, "timeout": timeout})
+    elif mode == "html":
+        res, _h = scrape_http_html(url, formats, timeout, headers, body)
+        result = {k: v for k, v in res.items() if not str(k).startswith("_cache_")}
+    else:
+        res, html = scrape_http_html(url, formats, timeout, headers, body)
+        res = {k: v for k, v in res.items() if not str(k).startswith("_cache_")}
+        if not should_escalate_to_playwright(html):
+            result = res
+        else:
+            out = scrape_playwright_fn.remote({**body, "url": url, "timeout": timeout})
+            if isinstance(out, dict) and "engine" in out:
+                out["engine"] = {**out["engine"], "escalated": True}
+            result = out
 
-    if mode == "js":
-        return scrape_playwright_fn.remote({**body, "url": url, "timeout": timeout})
+    result = {k: v for k, v in result.items() if not str(k).startswith("_cache_")}
 
-    if mode == "html":
-        res, _h = scrape_http_html(url, formats, timeout, headers)
-        return res
+    if max_age_ms is not None and mode in ("auto", "html", "js"):
+        ck = cache_key(url, _cache_parts_for_body({**body, "mode": mode}))
+        cd_cache = http_cache_dict()
+        cache_put(lambda k, v: cd_cache.__setitem__(k, v), ck, result)
 
-    # auto
-    res, html = scrape_http_html(url, formats, timeout, headers)
-    if not should_escalate_to_playwright(html):
-        return res
-    out = scrape_playwright_fn.remote({**body, "url": url, "timeout": timeout})
-    if isinstance(out, dict) and "engine" in out:
-        out["engine"] = {**out["engine"], "escalated": True}
-    return out
+    return result
 
 
 @app.function(
@@ -194,6 +343,7 @@ def batch_worker(batch_id: str, payload_json: str) -> None:
     formats = payload.get("formats") or ["markdown", "text", "json"]
     timeout = payload.get("timeout")
     hdrs = payload.get("headers")
+    scrape_opts = payload.get("scrape_options") or {}
 
     st = dict(bd[batch_id])
     st["status"] = "running"
@@ -207,13 +357,14 @@ def batch_worker(batch_id: str, payload_json: str) -> None:
             st["results"] = list(results)
             bd[batch_id] = st
             return
-        single = {
+        single = merge_scrape_options({
+            **scrape_opts,
             "url": u.strip(),
             "mode": mode,
             "formats": formats,
             "timeout": timeout,
             "headers": hdrs,
-        }
+        })
         try:
             assert_public_http_url(u.strip())
             r = perform_scrape(single)
@@ -229,6 +380,289 @@ def batch_worker(batch_id: str, payload_json: str) -> None:
     st["status"] = "completed"
     st["results"] = results
     bd[batch_id] = st
+
+
+def _webhook_should(ev: str, cfg: dict[str, Any] | None) -> bool:
+    if not cfg:
+        return False
+    events = cfg.get("events")
+    if not events:
+        return True
+    return ev in events
+
+
+def _emit_crawl_webhook(
+    state: dict[str, Any],
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    wh = state.get("webhook")
+    if not wh or not isinstance(wh, dict):
+        return
+    if not _webhook_should(event_type, wh):
+        return
+    url = wh.get("url")
+    secret = str(wh.get("secret") or "")
+    if not url or not secret:
+        return
+    deliver_with_retries(
+        url,
+        secret,
+        event_type,
+        payload,
+        metadata=wh.get("metadata") if isinstance(wh.get("metadata"), dict) else None,
+    )
+
+
+@app.function(
+    image=light_image,
+    secrets=[proxy_secret],
+    timeout=300,
+    cpu=1.0,
+    memory=2048,
+)
+def crawl_step_worker(crawl_id: str) -> None:
+    from scrape_core import build_headers
+
+    logger.info("crawl_step_worker start crawl_id=%s", crawl_id)
+    cd = crawls_dict()
+    try:
+        raw = dict(cd[crawl_id])
+    except KeyError:
+        return
+
+    if time.time() - float(raw.get("created_at", 0)) > CRAWL_TTL_SEC:
+        try:
+            del cd[crawl_id]
+        except KeyError:
+            pass
+        return
+
+    if raw.get("cancelled"):
+        raw["status"] = "cancelled"
+        cd[crawl_id] = raw
+        return
+
+    cfg = raw.get("config") or {}
+    seed = str(raw.get("seed") or "")
+    rules = CrawlRules.from_dict({**cfg, "limit": cfg.get("limit", 100)}, seed)
+    seed_host, seed_path = seed_parts(seed)
+    scrape_opts_prior = (
+        cfg.get("scrape_options") if isinstance(cfg.get("scrape_options"), dict) else {}
+    )
+    timeout = clamp_timeout(scrape_opts_prior.get("timeout"))
+
+    ua = build_headers(None).get("User-Agent", "ScraplusBot/1.0")
+
+    if raw.get("status") == "queued":
+        raw["status"] = "running"
+        cd[crawl_id] = raw
+        _emit_crawl_webhook(
+            raw,
+            "crawl.started",
+            {"crawl_id": crawl_id, "seed": seed},
+        )
+
+    frontier: list[dict[str, Any]] = list(raw.get("frontier") or [])
+    visited: list[str] = list(raw.get("visited") or [])
+    results: list[dict[str, Any]] = list(raw.get("results") or [])
+    errors: list[dict[str, Any]] = list(raw.get("errors") or [])
+    robots_bodies: dict[str, str | None] = dict(raw.get("robots_bodies") or {})
+    sitemap_seeded = bool(raw.get("sitemap_seeded"))
+
+    visited_set = set(visited)
+
+    if not sitemap_seeded and rules.sitemap_mode != "skip":
+        sm_urls = fetch_sitemap_urls(
+            seed, rules, timeout=timeout, max_urls=min(rules.limit * 2, 500)
+        )
+        for su in sm_urls:
+            try:
+                nu = normalize_url(su, ignore_query=rules.ignore_query_parameters)
+                if url_matches_rules(nu, rules, seed_host, seed_path):
+                    frontier.append({"url": nu, "depth": 0})
+            except Exception:
+                continue
+        raw["sitemap_seeded"] = True
+    if not sitemap_seeded and rules.sitemap_mode == "skip":
+        raw["sitemap_seeded"] = True
+
+    scrape_opts = scrape_opts_prior
+    steps = 0
+    max_conc = max(1, int(cfg.get("max_concurrency") or 1))
+
+    while steps < CRAWL_STEP_URLS * max_conc and len(results) < rules.limit and frontier:
+        if dict(cd[crawl_id]).get("cancelled"):
+            raw["cancelled"] = True
+            raw["status"] = "cancelled"
+            raw["frontier"] = frontier
+            raw["visited"] = visited
+            raw["results"] = results
+            raw["errors"] = errors
+            raw["robots_bodies"] = robots_bodies
+            cd[crawl_id] = raw
+            return
+
+        item = frontier.pop(0)
+        url = str(item.get("url") or "")
+        depth = int(item.get("depth") or 0)
+        try:
+            nu = normalize_url(url, ignore_query=rules.ignore_query_parameters)
+        except Exception as e:
+            errors.append({"url": url, "error": str(e)})
+            steps += 1
+            continue
+
+        if nu in visited_set:
+            steps += 1
+            continue
+
+        if rules.max_discovery_depth is not None and depth > rules.max_discovery_depth:
+            steps += 1
+            continue
+
+        if not url_matches_rules(nu, rules, seed_host, seed_path):
+            steps += 1
+            continue
+
+        if rules.robots_policy == "honor":
+            from urllib.parse import urlparse as _urlparse
+
+            p = _urlparse(nu)
+            host = (p.hostname or "").lower()
+            rkey = f"{p.scheme}://{host}"
+            if rkey not in robots_bodies:
+                robots_bodies[rkey] = fetch_robots_txt(host, p.scheme or "https", timeout=timeout)
+            if not can_fetch_url_robots(
+                nu, robots_body=robots_bodies[rkey], user_agent=ua
+            ):
+                errors.append({"url": nu, "error": "Blocked by robots.txt"})
+                visited.append(nu)
+                visited_set.add(nu)
+                steps += 1
+                continue
+
+        apply_delay(rules.delay_sec)
+
+        single = merge_scrape_options({
+            **scrape_opts,
+            "url": nu,
+            "mode": scrape_opts.get("mode") or "auto",
+            "formats": scrape_opts.get("formats") or ["markdown", "text"],
+            "timeout": scrape_opts.get("timeout") or timeout,
+            "headers": scrape_opts.get("headers") or cfg.get("headers"),
+        })
+
+        try:
+            assert_public_http_url(nu)
+            page_result = perform_scrape(single)
+            results.append(
+                {
+                    "url": nu,
+                    "ok": True,
+                    "depth": depth,
+                    "result": page_result,
+                }
+            )
+            visited.append(nu)
+            visited_set.add(nu)
+            _emit_crawl_webhook(
+                raw,
+                "crawl.page",
+                {"crawl_id": crawl_id, "url": nu, "page": page_result},
+            )
+
+            if rules.sitemap_mode != "only":
+                meta = page_result.get("metadata") or {}
+                ctype = meta.get("content_type") or ""
+                if "html" in ctype.lower() or page_result.get("engine", {}).get("name") in (
+                    "httpx",
+                    "playwright",
+                ):
+                    html_frag = (page_result.get("content") or {}).get("html")
+                    if isinstance(html_frag, str) and html_frag:
+                        for link in extract_links_from_html(html_frag, nu):
+                            try:
+                                ln = normalize_url(
+                                    link, ignore_query=rules.ignore_query_parameters
+                                )
+                            except Exception:
+                                continue
+                            if ln in visited_set:
+                                continue
+                            nd = depth + 1
+                            if (
+                                rules.max_discovery_depth is not None
+                                and nd > rules.max_discovery_depth
+                            ):
+                                continue
+                            if url_matches_rules(ln, rules, seed_host, seed_path):
+                                frontier.append({"url": ln, "depth": nd})
+        except Exception as e:
+            errors.append({"url": nu, "error": str(e)})
+            visited.append(nu)
+            visited_set.add(nu)
+
+        steps += 1
+
+    raw["frontier"] = frontier
+    raw["visited"] = visited
+    raw["results"] = results
+    raw["errors"] = errors
+    raw["robots_bodies"] = robots_bodies
+    raw["progress"] = len(results)
+
+    done = (
+        not frontier
+        or len(results) >= rules.limit
+        or raw.get("cancelled")
+    )
+    if done:
+        raw["status"] = "cancelled" if raw.get("cancelled") else "completed"
+        cd[crawl_id] = raw
+        ev = "crawl.failed" if raw.get("cancelled") else "crawl.completed"
+        _emit_crawl_webhook(
+            raw,
+            ev,
+            {
+                "crawl_id": crawl_id,
+                "completed": len(results),
+                "errors_count": len(errors),
+            },
+        )
+    else:
+        cd[crawl_id] = raw
+        crawl_step_worker.spawn(crawl_id)
+
+
+@app.function(
+    image=light_image,
+    secrets=[proxy_secret],
+    timeout=120,
+    cpu=1.0,
+    memory=1024,
+)
+def extract_llm_worker(job_id: str, payload_json: str) -> None:
+    jd = extract_jobs_dict()
+    payload: dict = json.loads(payload_json)
+    try:
+        urls = payload.get("urls") or []
+        html = payload.get("html")
+        data = llm_extract_sync(
+            html=html,
+            prompt=str(payload.get("prompt") or ""),
+            schema=payload.get("schema"),
+            urls=urls if urls else None,
+        )
+        prev = dict(jd[job_id])
+        prev["status"] = "completed"
+        prev["data"] = data
+        jd[job_id] = prev
+    except Exception as e:
+        prev = dict(jd[job_id])
+        prev["status"] = "failed"
+        prev["error"] = str(e)
+        jd[job_id] = prev
 
 
 @app.function(
@@ -257,15 +691,7 @@ def scraplus_api():
     @web.post("/scrape")
     def post_scrape(req: ScrapeRequest):
         try:
-            body: dict[str, Any] = {
-                "url": req.url.strip(),
-                "mode": req.mode,
-                "formats": req.formats or ["markdown", "text", "json"],
-                "timeout": req.timeout,
-                "headers": req.headers,
-                "wait_for": req.wait_for,
-                "screenshot": req.screenshot,
-            }
+            body = scrape_body_from_scrape_request(req)
             assert_public_http_url(body["url"])
             if req.async_job:
                 job_id = str(uuid.uuid4())
@@ -277,9 +703,11 @@ def scraplus_api():
                 scrape_job_worker.spawn(job_id, json.dumps(body, default=str))
                 return {"job_id": job_id, "status": "pending"}
             return perform_scrape(body)
-        except SsrfError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
         except ValueError as e:
+            if str(e) == "SCRAPE_NO_CACHED_DATA":
+                raise HTTPException(status_code=404, detail=str(e)) from e
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except SsrfError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except HTTPException:
             raise
@@ -293,7 +721,7 @@ def scraplus_api():
             raw = dict(jd[job_id])
         except KeyError:
             raise HTTPException(status_code=404, detail="Job not found") from None
-        data = touch_ttl(raw)
+        data = touch_ttl(raw, JOB_TTL_SEC)
         if data is None:
             try:
                 del jd[job_id]
@@ -329,6 +757,7 @@ def scraplus_api():
             "formats": req.formats,
             "timeout": req.timeout,
             "headers": req.headers,
+            "scrape_options": req.scrape_options or {},
         }
         batches_dict()[batch_id] = {
             "created_at": now,
@@ -348,7 +777,7 @@ def scraplus_api():
             raw = dict(bd[batch_id])
         except KeyError:
             raise HTTPException(status_code=404, detail="Batch not found") from None
-        data = touch_ttl(raw)
+        data = touch_ttl(raw, JOB_TTL_SEC)
         if data is None:
             try:
                 del bd[batch_id]
@@ -364,11 +793,220 @@ def scraplus_api():
             raw = dict(bd[batch_id])
         except KeyError:
             raise HTTPException(status_code=404, detail="Batch not found") from None
-        data = touch_ttl(raw)
+        data = touch_ttl(raw, JOB_TTL_SEC)
         if data is None:
             raise HTTPException(status_code=404, detail="Batch expired") from None
         data["cancelled"] = True
         bd[batch_id] = data
         return {"batch_id": batch_id, "cancelled": True}
+
+    @web.post("/crawl")
+    def post_crawl(req: CrawlRequest):
+        try:
+            seed = assert_public_http_url(req.url.strip())
+            cfg = req.model_dump(exclude={"url", "webhook"}, exclude_none=False)
+            cfg["limit"] = req.limit
+            crawl_id = str(uuid.uuid4())
+            now = time.time()
+            wh = None
+            if req.webhook:
+                wh = {
+                    "url": req.webhook.url,
+                    "secret": req.webhook.secret,
+                    "events": req.webhook.events,
+                    "metadata": req.webhook.metadata or {},
+                }
+            rules = CrawlRules.from_dict(cfg, seed)
+            frontier: list[dict[str, Any]] = []
+            if rules.sitemap_mode != "only":
+                try:
+                    frontier.append(
+                        {
+                            "url": normalize_url(
+                                seed,
+                                ignore_query=rules.ignore_query_parameters,
+                            ),
+                            "depth": 0,
+                        }
+                    )
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+
+            crawls_dict()[crawl_id] = {
+                "created_at": now,
+                "status": "queued",
+                "seed": seed,
+                "config": cfg,
+                "frontier": frontier,
+                "visited": [],
+                "results": [],
+                "errors": [],
+                "cancelled": False,
+                "webhook": wh,
+                "robots_bodies": {},
+                "sitemap_seeded": False,
+                "progress": 0,
+            }
+            crawl_step_worker.spawn(crawl_id)
+            return {"crawl_id": crawl_id, "status": "queued"}
+        except SsrfError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    @web.get("/crawl/{crawl_id}")
+    def get_crawl(crawl_id: str, skip: int = 0, page_limit: int = 50):
+        cd = crawls_dict()
+        try:
+            raw = dict(cd[crawl_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Crawl not found") from None
+        data = touch_ttl(raw, CRAWL_TTL_SEC)
+        if data is None:
+            try:
+                del cd[crawl_id]
+            except KeyError:
+                pass
+            raise HTTPException(status_code=404, detail="Crawl expired") from None
+        results = list(data.get("results") or [])
+        skip = max(0, skip)
+        page_limit = max(1, min(200, page_limit))
+        slice_res = results[skip : skip + page_limit]
+        next_skip = skip + page_limit if skip + page_limit < len(results) else None
+        return {
+            "crawl_id": crawl_id,
+            "status": data.get("status"),
+            "progress": data.get("progress"),
+            "completed": len(results),
+            "frontier_size": len(data.get("frontier") or []),
+            "data": slice_res,
+            "next": next_skip,
+            "errors": data.get("errors") or [],
+        }
+
+    @web.get("/crawl/{crawl_id}/errors")
+    def get_crawl_errors(crawl_id: str):
+        cd = crawls_dict()
+        try:
+            raw = dict(cd[crawl_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Crawl not found") from None
+        data = touch_ttl(raw, CRAWL_TTL_SEC)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Crawl expired") from None
+        return {"crawl_id": crawl_id, "errors": data.get("errors") or []}
+
+    @web.post("/crawl/{crawl_id}/cancel")
+    def cancel_crawl(crawl_id: str):
+        cd = crawls_dict()
+        try:
+            raw = dict(cd[crawl_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Crawl not found") from None
+        data = touch_ttl(raw, CRAWL_TTL_SEC)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Crawl expired") from None
+        data["cancelled"] = True
+        cd[crawl_id] = data
+        return {"crawl_id": crawl_id, "cancelled": True}
+
+    @web.post("/extract")
+    def post_extract(req: SelectorExtractRequest):
+        try:
+            assert_public_http_url(req.url.strip())
+            so = dict(req.scrape_options or {})
+            body = merge_scrape_options({
+                **so,
+                "url": req.url.strip(),
+                "mode": req.mode,
+                "timeout": req.timeout,
+                "headers": req.headers,
+                "formats": ["html"],
+            })
+            res = perform_scrape(body)
+            html = (res.get("content") or {}).get("html") or ""
+            if not isinstance(html, str):
+                html = ""
+            data = extract_with_selectors(html, req.selectors)
+            if req.schema:
+                try:
+                    jsonschema_validate(instance=data, schema=req.schema)
+                except ValidationError as e:
+                    raise HTTPException(status_code=422, detail=str(e.message)) from e
+            return {"success": True, "data": data, "source_url": res.get("url")}
+        except SsrfError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+
+    @web.post("/extract/llm")
+    def post_extract_llm(req: LLMExtractRequest):
+        try:
+            urls: list[str] = list(req.urls or [])
+            if req.url:
+                urls.insert(0, req.url.strip())
+            urls = [assert_public_http_url(u.strip()) for u in urls if u.strip()]
+            html: str | None = None
+            if urls:
+                body = merge_scrape_options({
+                    "url": urls[0],
+                    "mode": req.mode,
+                    "timeout": req.timeout,
+                    "headers": req.headers,
+                    "formats": ["html"],
+                })
+                pres = perform_scrape(body)
+                html = (pres.get("content") or {}).get("html")
+                html = html if isinstance(html, str) else None
+
+            if req.async_job:
+                job_id = str(uuid.uuid4())
+                extract_jobs_dict()[job_id] = {
+                    "status": "pending",
+                    "created_at": time.time(),
+                }
+                extract_llm_worker.spawn(
+                    job_id,
+                    json.dumps(
+                        {
+                            "urls": urls,
+                            "html": html,
+                            "prompt": req.prompt,
+                            "schema": req.schema,
+                        },
+                        default=str,
+                    ),
+                )
+                return {"job_id": job_id, "status": "pending"}
+
+            data = llm_extract_sync(
+                html=html,
+                prompt=req.prompt,
+                schema=req.schema,
+                urls=urls if len(urls) > 1 else None,
+            )
+            return {"success": True, "status": "completed", "data": data}
+        except SsrfError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+
+    @web.get("/extract/{job_id}")
+    def get_extract_job(job_id: str):
+        jd = extract_jobs_dict()
+        try:
+            raw = dict(jd[job_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Job not found") from None
+        data = touch_ttl(raw, JOB_TTL_SEC)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Job expired") from None
+        return data
 
     return web

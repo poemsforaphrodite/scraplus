@@ -22,6 +22,7 @@
 
 # local Python venv (Modal / pytest)
 .venv-modal/
+modal_app/.venv/
 
 # Python bytecode
 __pycache__/

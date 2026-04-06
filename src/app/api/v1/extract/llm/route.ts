@@ -3,8 +3,6 @@ import { modalRequest } from "@/lib/scraplus/modal-proxy";
 import { clampScrapeTimeout } from "@/lib/scraplus/timeout";
 import { assertPublicHttpUrl, SsrfError } from "@/lib/scrape/ssrf";
 
-const ALLOWED_MODES = new Set(["html", "js", "auto", "pdf", "ocr"]);
-
 function configErrorResponse() {
   return NextResponse.json(
     {
@@ -23,75 +21,91 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const urlsRaw = body.urls;
-  if (!Array.isArray(urlsRaw) || urlsRaw.length === 0) {
-    return NextResponse.json(
-      { error: "urls must be a non-empty array" },
-      { status: 400 },
-    );
+  const prompt =
+    typeof body.prompt === "string" ? body.prompt.trim() : "";
+  if (!prompt) {
+    return NextResponse.json({ error: "Missing prompt" }, { status: 400 });
   }
 
-  const urls: string[] = [];
-  for (const u of urlsRaw) {
-    const s = String(u).trim();
-    if (!s) continue;
+  let url: string | undefined;
+  if (typeof body.url === "string" && body.url.trim()) {
+    url = body.url.trim();
     try {
-      assertPublicHttpUrl(s);
-      urls.push(s);
+      assertPublicHttpUrl(url);
     } catch (e) {
       if (e instanceof SsrfError) {
-        return NextResponse.json(
-          { error: `Blocked URL: ${e.message}`, url: s },
-          { status: 400 },
-        );
+        return NextResponse.json({ error: e.message }, { status: 400 });
       }
       throw e;
     }
   }
 
-  if (urls.length === 0) {
-    return NextResponse.json({ error: "No valid URLs" }, { status: 400 });
+  let urls: string[] = [];
+  if (Array.isArray(body.urls)) {
+    for (const u of body.urls) {
+      const s = String(u).trim();
+      if (!s) continue;
+      try {
+        assertPublicHttpUrl(s);
+        urls.push(s);
+      } catch (e) {
+        if (e instanceof SsrfError) {
+          return NextResponse.json(
+            { error: `Blocked URL: ${e.message}`, url: s },
+            { status: 400 },
+          );
+        }
+        throw e;
+      }
+    }
   }
 
-  const modeRaw =
-    typeof body.mode === "string" ? body.mode.toLowerCase().trim() : "auto";
-  if (!ALLOWED_MODES.has(modeRaw)) {
+  if (!url && urls.length === 0) {
     return NextResponse.json(
-      { error: `Invalid mode "${modeRaw}"`, allowed: [...ALLOWED_MODES] },
+      { error: "Provide url and/or urls[] (Scraplus requires at least one URL for LLM extract today)." },
       { status: 400 },
     );
   }
 
-  let formats: string[] | undefined;
-  if (Array.isArray(body.formats) && body.formats.length > 0) {
-    formats = body.formats.map((f) => String(f).toLowerCase().trim());
-  }
+  const mode =
+    typeof body.mode === "string" ? body.mode.toLowerCase().trim() : "auto";
+  const timeout = clampScrapeTimeout(body.timeout);
 
   let headers: Record<string, string> | undefined;
-  if (body.headers != null && typeof body.headers === "object" && !Array.isArray(body.headers)) {
+  if (
+    body.headers != null &&
+    typeof body.headers === "object" &&
+    !Array.isArray(body.headers)
+  ) {
     headers = {};
     for (const [k, v] of Object.entries(body.headers)) {
       if (typeof v === "string") headers[k] = v;
     }
   }
 
+  const asyncJob = Boolean(
+    body.async === true || body.async_job === true,
+  );
+
   const forward: Record<string, unknown> = {
-    urls,
-    mode: modeRaw,
-    timeout: clampScrapeTimeout(body.timeout),
+    prompt,
+    mode,
+    timeout,
+    ...(url ? { url } : {}),
+    ...(urls.length ? { urls } : {}),
+    ...(headers && Object.keys(headers).length ? { headers } : {}),
+    ...(asyncJob ? { async: true } : {}),
   };
-  if (formats) forward.formats = formats;
-  if (headers && Object.keys(headers).length) forward.headers = headers;
   if (
-    body.scrape_options != null &&
-    typeof body.scrape_options === "object" &&
-    !Array.isArray(body.scrape_options)
+    body.schema != null &&
+    typeof body.schema === "object" &&
+    !Array.isArray(body.schema)
   ) {
-    forward.scrape_options = body.scrape_options;
+    forward.schema = body.schema;
   }
 
   try {
-    const res = await modalRequest("/batch", {
+    const res = await modalRequest("/extract/llm", {
       method: "POST",
       body: JSON.stringify(forward),
     });

@@ -19,7 +19,7 @@ import { clsx } from "clsx";
 const NAV = [
   { href: "/scrape", label: "Scrape", icon: Scissors, soon: false },
   { href: "/batch", label: "Batch", icon: Layers, soon: false },
-  { href: "/crawl", label: "Crawl", icon: Network, soon: true },
+  { href: "/crawl", label: "Crawl", icon: Network, soon: false },
   { href: "/schedules", label: "Schedules", icon: LayoutGrid, soon: true },
   { href: "/monitors", label: "Monitors", icon: Radar, soon: true },
 ] as const;
