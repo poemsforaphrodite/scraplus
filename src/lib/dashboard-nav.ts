@@ -2,8 +2,10 @@ export const DASHBOARD_NAV_ITEMS = [
   { href: "/scrape", label: "Scrape", soon: false },
   { href: "/batch", label: "Batch", soon: false },
   { href: "/crawl", label: "Crawl", soon: false },
-  { href: "/schedules", label: "Schedules", soon: true },
-  { href: "/monitors", label: "Monitors", soon: true },
+  { href: "/extract", label: "Extract", soon: false },
+  { href: "/map", label: "Map", soon: false },
+  { href: "/schedules", label: "Schedules", soon: false },
+  { href: "/monitors", label: "Monitors", soon: false },
 ] as const;
 
 export type DashboardNavHref = (typeof DASHBOARD_NAV_ITEMS)[number]["href"];
@@ -17,6 +19,8 @@ export function pageTitleForPath(pathname: string): {
     scrape: "Scrape playground",
     batch: "Batch manager",
     crawl: "Recursive crawl",
+    extract: "Extract playground",
+    map: "Map explorer",
     schedules: "Schedules",
     monitors: "Monitors",
   };

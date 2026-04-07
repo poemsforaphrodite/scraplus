@@ -1,5 +1,5 @@
-import { ComingSoon } from "../coming-soon";
+import { ScheduleManager } from "@/components/scraplus/schedule-manager";
 
 export default function SchedulesPage() {
-  return <ComingSoon title="Schedules" />;
+  return <ScheduleManager />;
 }

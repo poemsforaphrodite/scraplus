@@ -1,0 +1,14 @@
+{
+  "name": "scraplus",
+  "version": "0.1.0",
+  "description": "Scraplus Node.js SDK — web scraping, crawling, extraction, and more",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test src/*.test.ts"
+  },
+  "keywords": ["scraping", "crawling", "web", "extract"],
+  "license": "MIT"
+}

@@ -89,6 +89,13 @@ export async function POST(request: Request) {
   ) {
     forward.scrape_options = body.scrape_options;
   }
+  if (
+    body.webhook != null &&
+    typeof body.webhook === "object" &&
+    !Array.isArray(body.webhook)
+  ) {
+    forward.webhook = body.webhook;
+  }
 
   try {
     const res = await modalRequest("/batch", {

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scraplus"
+version = "0.1.0"
+description = "Scraplus Python SDK — web scraping, crawling, extraction, and more"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = ["httpx>=0.25"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]

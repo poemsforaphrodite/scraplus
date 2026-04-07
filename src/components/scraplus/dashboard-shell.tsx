@@ -4,9 +4,11 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { startTransition, useEffect, useState } from "react";
 import {
+  Braces,
   Command,
   Layers,
   LayoutGrid,
+  Map,
   Menu,
   Moon,
   Network,
@@ -23,6 +25,8 @@ const ICONS = {
   "/scrape": Scissors,
   "/batch": Layers,
   "/crawl": Network,
+  "/extract": Braces,
+  "/map": Map,
   "/schedules": LayoutGrid,
   "/monitors": Radar,
 } as const;

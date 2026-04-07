@@ -1,5 +1,5 @@
-import { ComingSoon } from "../coming-soon";
+import { MonitorManager } from "@/components/scraplus/monitor-manager";
 
 export default function MonitorsPage() {
-  return <ComingSoon title="Monitors" />;
+  return <MonitorManager />;
 }

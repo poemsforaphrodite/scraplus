@@ -72,8 +72,20 @@ def scrape_with_playwright(body: dict[str, Any]) -> dict[str, Any]:
             final_url = page.url
             screenshot_b64: str | None = None
             if want_shot:
+                shot_cfg = body.get("screenshot") if isinstance(body.get("screenshot"), dict) else {}
+                full_page = bool(shot_cfg.get("fullPage", False)) if isinstance(shot_cfg, dict) else False
+                quality = None
+                if isinstance(shot_cfg, dict) and "quality" in shot_cfg:
+                    quality = max(0, min(100, int(shot_cfg["quality"])))
+                vp = shot_cfg.get("viewport") if isinstance(shot_cfg, dict) else None
+                if isinstance(vp, dict) and "width" in vp and "height" in vp:
+                    page.set_viewport_size({"width": int(vp["width"]), "height": int(vp["height"])})
+                shot_type = "jpeg" if quality is not None else "png"
+                shot_args: dict[str, Any] = {"type": shot_type, "full_page": full_page}
+                if quality is not None:
+                    shot_args["quality"] = quality
                 screenshot_b64 = base64.b64encode(
-                    page.screenshot(type="png", full_page=False)
+                    page.screenshot(**shot_args)
                 ).decode("ascii")
         finally:
             browser.close()

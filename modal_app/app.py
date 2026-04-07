@@ -32,6 +32,8 @@ from crawl_lib import (
 )
 from extract_selectors import extract_with_selectors
 from llm_extract import llm_extract_sync
+from map_lib import discover_urls
+from schedule_lib import cron_matches, next_run_after, parse_cron, validate_schedule
 from scrape_core import (
     clamp_timeout,
     merge_scrape_options,
@@ -53,6 +55,12 @@ JOBS_DICT = "scraplus-jobs-v1"
 BATCH_DICT = "scraplus-batches-v1"
 CRAWL_DICT = "scraplus-crawls-v1"
 EXTRACT_JOBS_DICT = "scraplus-extract-jobs-v1"
+SCHEDULES_DICT = "scraplus-schedules-v1"
+SCHEDULE_RUNS_DICT = "scraplus-schedule-runs-v1"
+MONITORS_DICT = "scraplus-monitors-v1"
+MONITOR_SNAPSHOTS_DICT = "scraplus-monitor-snapshots-v1"
+API_KEYS_DICT = "scraplus-api-keys-v1"
+USAGE_DICT = "scraplus-usage-v1"
 
 _SCRAPLUS_DIR = Path(__file__).resolve().parent
 _REQ_FILE = "modal_app/requirements-light.txt"
@@ -108,6 +116,30 @@ def crawls_dict() -> modal.Dict:
 
 def extract_jobs_dict() -> modal.Dict:
     return modal.Dict.from_name(EXTRACT_JOBS_DICT, create_if_missing=True)
+
+
+def schedules_dict() -> modal.Dict:
+    return modal.Dict.from_name(SCHEDULES_DICT, create_if_missing=True)
+
+
+def schedule_runs_dict() -> modal.Dict:
+    return modal.Dict.from_name(SCHEDULE_RUNS_DICT, create_if_missing=True)
+
+
+def monitors_dict() -> modal.Dict:
+    return modal.Dict.from_name(MONITORS_DICT, create_if_missing=True)
+
+
+def monitor_snapshots_dict() -> modal.Dict:
+    return modal.Dict.from_name(MONITOR_SNAPSHOTS_DICT, create_if_missing=True)
+
+
+def api_keys_dict() -> modal.Dict:
+    return modal.Dict.from_name(API_KEYS_DICT, create_if_missing=True)
+
+
+def usage_dict() -> modal.Dict:
+    return modal.Dict.from_name(USAGE_DICT, create_if_missing=True)
 
 
 def http_cache_dict() -> modal.Dict:
@@ -185,6 +217,7 @@ class BatchRequest(BaseModel):
     timeout: float | None = None
     headers: dict[str, str] | None = None
     scrape_options: dict[str, Any] | None = None
+    webhook: WebhookConfig | None = None
 
 
 class SelectorExtractRequest(BaseModel):
@@ -210,6 +243,45 @@ class LLMExtractRequest(BaseModel):
     timeout: float | None = None
     headers: dict[str, str] | None = None
     async_job: bool = Field(default=False, alias="async")
+
+
+class MapRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    url: str
+    limit: int = 5000
+    ignore_sitemap: bool = Field(default=False, alias="ignoreSitemap")
+    include_subdomains: bool = Field(default=True, alias="includeSubdomains")
+    search: str | None = None
+    timeout: float | None = None
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    query: str
+    limit: int = 5
+    lang: str | None = None
+    location: str | None = None
+    scrape_options: dict[str, Any] | None = Field(default=None, alias="scrapeOptions")
+    timeout: float | None = None
+
+
+class InteractAction(BaseModel):
+    type: str  # click, type, scroll, wait, screenshot
+    selector: str | None = None
+    text: str | None = None
+    value: int | None = None
+
+
+class InteractRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    url: str
+    actions: list[InteractAction]
+    timeout: float | None = None
+    formats: list[str] | None = None
+    headers: dict[str, str] | None = None
 
 
 @app.function(
@@ -344,10 +416,18 @@ def batch_worker(batch_id: str, payload_json: str) -> None:
     timeout = payload.get("timeout")
     hdrs = payload.get("headers")
     scrape_opts = payload.get("scrape_options") or {}
+    wh = payload.get("webhook")
 
     st = dict(bd[batch_id])
     st["status"] = "running"
     bd[batch_id] = st
+
+    if wh:
+        _emit_crawl_webhook(
+            {"webhook": wh},
+            "batch.started",
+            {"batch_id": batch_id, "total": len(urls)},
+        )
 
     results: list[dict] = []
     for i, u in enumerate(urls):
@@ -369,6 +449,12 @@ def batch_worker(batch_id: str, payload_json: str) -> None:
             assert_public_http_url(u.strip())
             r = perform_scrape(single)
             results.append({"url": u, "ok": True, "result": r})
+            if wh:
+                _emit_crawl_webhook(
+                    {"webhook": wh},
+                    "batch.page",
+                    {"batch_id": batch_id, "url": u, "index": i},
+                )
         except Exception as e:
             results.append({"url": u, "ok": False, "error": str(e)})
         st = dict(bd[batch_id])
@@ -380,6 +466,13 @@ def batch_worker(batch_id: str, payload_json: str) -> None:
     st["status"] = "completed"
     st["results"] = results
     bd[batch_id] = st
+
+    if wh:
+        _emit_crawl_webhook(
+            {"webhook": wh},
+            "batch.completed",
+            {"batch_id": batch_id, "completed": len(results)},
+        )
 
 
 def _webhook_should(ev: str, cfg: dict[str, Any] | None) -> bool:
@@ -666,6 +759,81 @@ def extract_llm_worker(job_id: str, payload_json: str) -> None:
 
 
 @app.function(
+    image=browser_image,
+    secrets=[proxy_secret],
+    timeout=120,
+    cpu=1.0,
+    memory=2048,
+)
+def interact_worker(body: dict) -> dict:
+    from playwright.sync_api import sync_playwright
+    from scrape_core import build_response_from_html, clamp_timeout, build_headers
+
+    url = body["url"]
+    assert_public_http_url(url)
+    timeout = clamp_timeout(body.get("timeout"))
+    hdrs = build_headers(body.get("headers"))
+    formats = body.get("formats") or ["markdown", "text", "json"]
+    actions = body.get("actions") or []
+    timeout_ms = int(timeout * 1000)
+
+    ua = hdrs.get("User-Agent")
+    extra = {k: v for k, v in hdrs.items() if k.lower() != "user-agent"}
+
+    action_results: list[dict[str, Any]] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            ctx = browser.new_context(user_agent=ua, extra_http_headers=extra)
+            page = ctx.new_page()
+            page.set_default_timeout(timeout_ms)
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            status_code = int(resp.status) if resp else 200
+
+            for act in actions:
+                atype = act.get("type", "").lower()
+                sel = act.get("selector")
+                try:
+                    if atype == "click" and sel:
+                        page.click(sel, timeout=timeout_ms)
+                        action_results.append({"type": "click", "selector": sel, "ok": True})
+                    elif atype == "type" and sel:
+                        text = act.get("text", "")
+                        page.fill(sel, text, timeout=timeout_ms)
+                        action_results.append({"type": "type", "selector": sel, "ok": True})
+                    elif atype == "scroll":
+                        value = int(act.get("value") or 500)
+                        page.evaluate(f"window.scrollBy(0, {value})")
+                        action_results.append({"type": "scroll", "value": value, "ok": True})
+                    elif atype == "wait":
+                        import time as _time
+                        wait_ms = min(int(act.get("value") or 1000), 30000)
+                        _time.sleep(wait_ms / 1000.0)
+                        action_results.append({"type": "wait", "ms": wait_ms, "ok": True})
+                    elif atype == "screenshot":
+                        import base64
+                        shot = base64.b64encode(page.screenshot(type="png", full_page=False)).decode("ascii")
+                        action_results.append({"type": "screenshot", "ok": True, "screenshot_base64": shot})
+                    else:
+                        action_results.append({"type": atype, "ok": False, "error": f"Unknown action: {atype}"})
+                except Exception as e:
+                    action_results.append({"type": atype, "ok": False, "error": str(e)})
+
+            html = page.content()
+            final_url = page.url
+        finally:
+            browser.close()
+
+    result = build_response_from_html(
+        html, formats, final_url, status_code, "text/html",
+        engine="playwright", escalated=False, body=body,
+    )
+    result["actions"] = action_results
+    return result
+
+
+@app.function(
     image=light_image,
     secrets=[proxy_secret],
     timeout=120,
@@ -751,6 +919,14 @@ def scraplus_api():
 
         batch_id = str(uuid.uuid4())
         now = time.time()
+        wh = None
+        if req.webhook:
+            wh = {
+                "url": req.webhook.url,
+                "secret": req.webhook.secret,
+                "events": req.webhook.events,
+                "metadata": req.webhook.metadata or {},
+            }
         payload = {
             "urls": cleaned,
             "mode": req.mode,
@@ -758,6 +934,7 @@ def scraplus_api():
             "timeout": req.timeout,
             "headers": req.headers,
             "scrape_options": req.scrape_options or {},
+            "webhook": wh,
         }
         batches_dict()[batch_id] = {
             "created_at": now,
@@ -1007,6 +1184,477 @@ def scraplus_api():
         data = touch_ttl(raw, JOB_TTL_SEC)
         if data is None:
             raise HTTPException(status_code=404, detail="Job expired") from None
+        return data
+
+    @web.post("/map")
+    def post_map(req: MapRequest):
+        try:
+            urls = discover_urls(
+                req.url.strip(),
+                limit=req.limit,
+                ignore_sitemap=req.ignore_sitemap,
+                include_subdomains=req.include_subdomains,
+                search=req.search,
+                timeout=clamp_timeout(req.timeout),
+            )
+            return {"success": True, "links": urls}
+        except SsrfError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+
+    @web.post("/search")
+    def post_search(req: SearchRequest):
+        api_key = (
+            os.environ.get("SCRAPLUS_SEARCH_API_KEY")
+            or os.environ.get("BRAVE_SEARCH_API_KEY")
+            or ""
+        ).strip()
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Search requires SCRAPLUS_SEARCH_API_KEY or BRAVE_SEARCH_API_KEY",
+            )
+        try:
+            import httpx as _httpx
+
+            params: dict[str, Any] = {
+                "q": req.query,
+                "count": max(1, min(100, req.limit)),
+            }
+            if req.lang:
+                params["search_lang"] = req.lang
+            if req.location:
+                params["country"] = req.location
+
+            t = _httpx.Timeout(30.0, connect=10.0)
+            with _httpx.Client(timeout=t) as client:
+                r = client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params=params,
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-Encoding": "gzip",
+                        "X-Subscription-Token": api_key,
+                    },
+                )
+                r.raise_for_status()
+                search_data = r.json()
+
+            results_raw = search_data.get("web", {}).get("results", [])
+            data: list[dict[str, Any]] = []
+            for item in results_raw[: req.limit]:
+                entry: dict[str, Any] = {
+                    "url": item.get("url", ""),
+                    "title": item.get("title", ""),
+                    "description": item.get("description", ""),
+                }
+                if req.scrape_options:
+                    so = req.scrape_options
+                    u = entry["url"]
+                    try:
+                        assert_public_http_url(u)
+                        scrape_body = merge_scrape_options({
+                            **so,
+                            "url": u,
+                            "mode": so.get("mode") or "auto",
+                            "formats": so.get("formats") or ["markdown"],
+                            "timeout": clamp_timeout(req.timeout),
+                        })
+                        page = perform_scrape(scrape_body)
+                        entry["content"] = page.get("content")
+                        entry["metadata"] = page.get("metadata")
+                    except Exception:
+                        pass
+                data.append(entry)
+            return {"success": True, "data": data}
+        except _httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=502, detail=f"Search API error: {e}") from e
+        except SsrfError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+
+    @web.post("/interact")
+    def post_interact(req: InteractRequest):
+        try:
+            assert_public_http_url(req.url.strip())
+            body: dict[str, Any] = {
+                "url": req.url.strip(),
+                "actions": [a.model_dump(exclude_none=True) for a in req.actions],
+                "timeout": clamp_timeout(req.timeout),
+                "formats": req.formats or ["markdown", "text", "json"],
+            }
+            if req.headers:
+                body["headers"] = req.headers
+            result = interact_worker.remote(body)
+            return result
+        except SsrfError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+
+    # ── Schedules ────────────────────────────────────────────────────────
+
+    @web.post("/schedules")
+    def create_schedule(request: Request):
+        import json as _json
+        body = _json.loads(request._body if hasattr(request, "_body") else "{}")
+        # FastAPI will have already parsed - use sync approach
+        return _create_schedule_impl(body)
+
+    @web.post("/schedules/create")
+    def create_schedule_alt(body: dict = {}):
+        return _create_schedule_impl(body)
+
+    def _create_schedule_impl(body: dict) -> dict:
+        errs = validate_schedule(body)
+        if errs:
+            raise HTTPException(status_code=400, detail="; ".join(errs))
+        sid = str(uuid.uuid4())
+        now = time.time()
+        entry = {
+            "id": sid,
+            "url": str(body["url"]).strip(),
+            "cron": str(body["cron"]).strip(),
+            "name": str(body.get("name") or ""),
+            "enabled": bool(body.get("enabled", True)),
+            "scrape_options": body.get("scrape_options") or {},
+            "webhook": body.get("webhook"),
+            "created_at": now,
+            "updated_at": now,
+            "last_run_at": None,
+            "next_run_at": None,
+            "run_count": 0,
+        }
+        from datetime import datetime, timezone
+        try:
+            nxt = next_run_after(entry["cron"], datetime.now(timezone.utc))
+            if nxt:
+                entry["next_run_at"] = nxt.isoformat()
+        except Exception:
+            pass
+        sd = schedules_dict()
+        sd[sid] = entry
+        idx = _schedules_index(sd)
+        idx.append(sid)
+        sd["__index__"] = idx
+        return {"id": sid, "status": "created", "schedule": entry}
+
+    def _schedules_index(sd) -> list[str]:
+        try:
+            return list(sd["__index__"])
+        except KeyError:
+            return []
+
+    @web.get("/schedules")
+    def list_schedules():
+        sd = schedules_dict()
+        idx = _schedules_index(sd)
+        items = []
+        for sid in idx:
+            try:
+                items.append(dict(sd[sid]))
+            except KeyError:
+                continue
+        return {"schedules": items}
+
+    @web.get("/schedules/{schedule_id}")
+    def get_schedule(schedule_id: str):
+        sd = schedules_dict()
+        try:
+            entry = dict(sd[schedule_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Schedule not found") from None
+        rd = schedule_runs_dict()
+        runs = []
+        try:
+            run_ids = list(rd[f"__runs__{schedule_id}"])
+            for rid in run_ids[-20:]:
+                try:
+                    runs.append(dict(rd[rid]))
+                except KeyError:
+                    continue
+        except KeyError:
+            pass
+        return {"schedule": entry, "runs": runs}
+
+    @web.patch("/schedules/{schedule_id}")
+    def update_schedule(schedule_id: str, request: Request):
+        sd = schedules_dict()
+        try:
+            entry = dict(sd[schedule_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Schedule not found") from None
+        import json as _json
+        try:
+            body = _json.loads(request._body if hasattr(request, "_body") else "{}")
+        except Exception:
+            body = {}
+        if "cron" in body:
+            try:
+                parse_cron(str(body["cron"]))
+                entry["cron"] = str(body["cron"])
+            except (ValueError, IndexError):
+                raise HTTPException(status_code=400, detail="Invalid cron") from None
+        if "enabled" in body:
+            entry["enabled"] = bool(body["enabled"])
+        if "name" in body:
+            entry["name"] = str(body["name"])
+        if "scrape_options" in body:
+            entry["scrape_options"] = body["scrape_options"] or {}
+        if "webhook" in body:
+            entry["webhook"] = body["webhook"]
+        entry["updated_at"] = time.time()
+        from datetime import datetime, timezone
+        try:
+            nxt = next_run_after(entry["cron"], datetime.now(timezone.utc))
+            if nxt:
+                entry["next_run_at"] = nxt.isoformat()
+        except Exception:
+            pass
+        sd[schedule_id] = entry
+        return {"schedule": entry}
+
+    @web.delete("/schedules/{schedule_id}")
+    def delete_schedule(schedule_id: str):
+        sd = schedules_dict()
+        try:
+            del sd[schedule_id]
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Schedule not found") from None
+        idx = _schedules_index(sd)
+        idx = [s for s in idx if s != schedule_id]
+        sd["__index__"] = idx
+        return {"deleted": True}
+
+    @web.get("/schedules/{schedule_id}/runs")
+    def list_schedule_runs(schedule_id: str, skip: int = 0, limit: int = 50):
+        rd = schedule_runs_dict()
+        try:
+            run_ids = list(rd[f"__runs__{schedule_id}"])
+        except KeyError:
+            run_ids = []
+        run_ids = list(reversed(run_ids))
+        sliced = run_ids[skip : skip + limit]
+        runs = []
+        for rid in sliced:
+            try:
+                runs.append(dict(rd[rid]))
+            except KeyError:
+                continue
+        return {"runs": runs, "total": len(run_ids)}
+
+    @web.get("/schedules/{schedule_id}/runs/{run_id}")
+    def get_schedule_run(schedule_id: str, run_id: str):
+        rd = schedule_runs_dict()
+        try:
+            return dict(rd[run_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Run not found") from None
+
+    # ── Monitors ─────────────────────────────────────────────────────────
+
+    @web.post("/monitors")
+    def create_monitor(body: dict = {}):
+        if not body.get("url"):
+            raise HTTPException(status_code=400, detail="url is required")
+        if not body.get("cron"):
+            raise HTTPException(status_code=400, detail="cron is required")
+        try:
+            parse_cron(str(body["cron"]))
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail="Invalid cron") from None
+
+        mid = str(uuid.uuid4())
+        now = time.time()
+        entry = {
+            "id": mid,
+            "url": str(body["url"]).strip(),
+            "cron": str(body["cron"]).strip(),
+            "name": str(body.get("name") or ""),
+            "enabled": bool(body.get("enabled", True)),
+            "diff_mode": str(body.get("diff_mode") or "exact"),
+            "selectors": body.get("selectors"),
+            "webhook": body.get("webhook"),
+            "created_at": now,
+            "updated_at": now,
+            "last_check_at": None,
+            "change_count": 0,
+            "check_count": 0,
+        }
+        from datetime import datetime, timezone
+        try:
+            nxt = next_run_after(entry["cron"], datetime.now(timezone.utc))
+            if nxt:
+                entry["next_check_at"] = nxt.isoformat()
+        except Exception:
+            pass
+        md = monitors_dict()
+        md[mid] = entry
+        idx = _monitors_index(md)
+        idx.append(mid)
+        md["__index__"] = idx
+        return {"id": mid, "status": "created", "monitor": entry}
+
+    def _monitors_index(md) -> list[str]:
+        try:
+            return list(md["__index__"])
+        except KeyError:
+            return []
+
+    @web.get("/monitors")
+    def list_monitors():
+        md = monitors_dict()
+        idx = _monitors_index(md)
+        items = []
+        for mid in idx:
+            try:
+                items.append(dict(md[mid]))
+            except KeyError:
+                continue
+        return {"monitors": items}
+
+    @web.get("/monitors/{monitor_id}")
+    def get_monitor(monitor_id: str):
+        md = monitors_dict()
+        try:
+            entry = dict(md[monitor_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Monitor not found") from None
+        return {"monitor": entry}
+
+    @web.patch("/monitors/{monitor_id}")
+    def update_monitor(monitor_id: str, body: dict = {}):
+        md = monitors_dict()
+        try:
+            entry = dict(md[monitor_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Monitor not found") from None
+        if "cron" in body:
+            try:
+                parse_cron(str(body["cron"]))
+                entry["cron"] = str(body["cron"])
+            except (ValueError, IndexError):
+                raise HTTPException(status_code=400, detail="Invalid cron") from None
+        for k in ("enabled", "name", "diff_mode", "selectors", "webhook"):
+            if k in body:
+                entry[k] = body[k]
+        entry["updated_at"] = time.time()
+        md[monitor_id] = entry
+        return {"monitor": entry}
+
+    @web.delete("/monitors/{monitor_id}")
+    def delete_monitor(monitor_id: str):
+        md = monitors_dict()
+        try:
+            del md[monitor_id]
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Monitor not found") from None
+        idx = _monitors_index(md)
+        idx = [m for m in idx if m != monitor_id]
+        md["__index__"] = idx
+        return {"deleted": True}
+
+    @web.get("/monitors/{monitor_id}/changes")
+    def list_monitor_changes(monitor_id: str, skip: int = 0, limit: int = 50):
+        sd = monitor_snapshots_dict()
+        try:
+            change_ids = list(sd[f"__changes__{monitor_id}"])
+        except KeyError:
+            change_ids = []
+        change_ids = list(reversed(change_ids))
+        sliced = change_ids[skip : skip + limit]
+        changes = []
+        for cid in sliced:
+            try:
+                changes.append(dict(sd[cid]))
+            except KeyError:
+                continue
+        return {"changes": changes, "total": len(change_ids)}
+
+    # ── API Keys & Usage ─────────────────────────────────────────────────
+
+    @web.post("/auth/keys")
+    def create_api_key(body: dict = {}):
+        import hashlib as _hashlib
+        import secrets as _secrets
+        raw_key = f"sk_live_{_secrets.token_hex(24)}"
+        key_hash = _hashlib.sha256(raw_key.encode()).hexdigest()
+        kid = str(uuid.uuid4())
+        now = time.time()
+        entry = {
+            "id": kid,
+            "key_hash": key_hash,
+            "prefix": raw_key[:12] + "..." + raw_key[-4:],
+            "name": str(body.get("name") or ""),
+            "created_at": now,
+            "last_used_at": None,
+            "revoked": False,
+        }
+        kd = api_keys_dict()
+        kd[kid] = entry
+        kd[f"__hash__{key_hash}"] = kid
+        idx: list[str] = []
+        try:
+            idx = list(kd["__index__"])
+        except KeyError:
+            pass
+        idx.append(kid)
+        kd["__index__"] = idx
+        return {"id": kid, "key": raw_key, "prefix": entry["prefix"]}
+
+    @web.get("/auth/keys")
+    def list_api_keys():
+        kd = api_keys_dict()
+        idx: list[str] = []
+        try:
+            idx = list(kd["__index__"])
+        except KeyError:
+            pass
+        keys = []
+        for kid in idx:
+            try:
+                entry = dict(kd[kid])
+                if not entry.get("revoked"):
+                    keys.append({
+                        "id": entry["id"],
+                        "prefix": entry["prefix"],
+                        "name": entry.get("name", ""),
+                        "created_at": entry["created_at"],
+                        "last_used_at": entry.get("last_used_at"),
+                    })
+            except KeyError:
+                continue
+        return {"keys": keys}
+
+    @web.delete("/auth/keys/{key_id}")
+    def revoke_api_key(key_id: str):
+        kd = api_keys_dict()
+        try:
+            entry = dict(kd[key_id])
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Key not found") from None
+        entry["revoked"] = True
+        kd[key_id] = entry
+        return {"revoked": True}
+
+    @web.get("/usage")
+    def get_usage():
+        ud = usage_dict()
+        try:
+            data = dict(ud["__global__"])
+        except KeyError:
+            data = {
+                "total_requests": 0,
+                "success": 0,
+                "failed": 0,
+                "last_request_at": None,
+            }
         return data
 
     return web

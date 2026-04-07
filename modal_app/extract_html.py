@@ -8,7 +8,7 @@ from typing import Any
 from bs4 import BeautifulSoup, Tag
 from markdownify import markdownify as html_to_md
 
-ALLOWED_FORMATS = frozenset({"html", "text", "markdown", "json"})
+ALLOWED_FORMATS = frozenset({"html", "text", "markdown", "json", "links", "images"})
 
 
 def _pick_main_root(soup: BeautifulSoup) -> Tag | None:
@@ -127,6 +127,30 @@ def extract_from_html(
             "language": language,
             "wordCount": len(words),
         }
+
+    if "links" in fmt:
+        links: list[dict[str, str]] = []
+        link_soup = BeautifulSoup(html, "lxml")
+        for a in link_soup.find_all("a", href=True):
+            href = str(a["href"]).strip()
+            if href and not href.startswith(("#", "javascript:", "mailto:")):
+                links.append({
+                    "href": href,
+                    "text": a.get_text(strip=True) or "",
+                })
+        content["links"] = links
+
+    if "images" in fmt:
+        images: list[dict[str, str]] = []
+        img_soup = BeautifulSoup(html, "lxml")
+        for img in img_soup.find_all("img", src=True):
+            src = str(img["src"]).strip()
+            if src:
+                images.append({
+                    "src": src,
+                    "alt": str(img.get("alt", "")).strip(),
+                })
+        content["images"] = images
 
     return {
         "title": title,
